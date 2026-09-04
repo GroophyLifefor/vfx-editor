@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Version tag
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ($v -match '^(\d+)\.(\d+)\.0$') { $tag = "v$($Matches[1]).$($Matches[2])" }
+          else { $tag = "v$v" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "name=VFX Player $tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = "target/release/vfx_editor.exe"
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $title = "${{ steps.ver.outputs.name }}"
+          $notes = "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg is bundled."
+          if (gh release view $tag --json id 2>$null) {
+            gh release upload $tag $exe --clobber
+          } else {
+            gh release create $tag $exe --title $title --notes $notes --latest
+          }

@@ -1,0 +1,16 @@
+[package]
+name = "vfx_editor"
+version = "0.1.0"
+edition = "2024"
+description = "Frame-accurate video player"
+repository = "https://github.com/GroophyLifefor/vfx-editor"
+
+[dependencies]
+eframe = "0.34"
+rfd = "0.15"
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
+zstd = "0.13"
+
+[build-dependencies]
+winresource = "0.1"
+zstd = "0.13"
