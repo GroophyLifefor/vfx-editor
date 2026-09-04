@@ -1,6 +1,6 @@
 # VFX Player
 
-**Advanced Video Player for VFX Experts** — v0.1.1. Frame-accurate review, not a consumer player. No installer.
+**Advanced Video Player for VFX Experts** — v0.1.2. Frame-accurate review, not a consumer player. No installer.
 
 [![Download](https://img.shields.io/github/v/release/GroophyLifefor/vfx-editor?label=Download)](https://github.com/GroophyLifefor/vfx-editor/releases/latest)
 
@@ -36,7 +36,7 @@ Windows SmartScreen may warn on the first run (unsigned build). Choose **More in
 - Preview zoom, Fit W / Fit H, pan when zoomed
 - Drag the strips above the waveform and ruler to resize them
 - **TR / EN**, dark / light
-- If a newer GitHub release exists, an **Update** button appears (offline: nothing happens)
+- If a newer GitHub release exists, **Update** downloads it, replaces this exe, and relaunches (offline: nothing happens)
 
 ## Language
 

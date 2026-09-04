@@ -28,6 +28,8 @@ const REPO_URL: &str = "https://github.com/GroophyLifefor/vfx-editor";
 const REPO_RELEASES: &str = "https://github.com/GroophyLifefor/vfx-editor/releases/latest";
 const REPO_API: &str =
     "https://api.github.com/repos/GroophyLifefor/vfx-editor/releases/latest";
+const EXE_DOWNLOAD: &str =
+    "https://github.com/GroophyLifefor/vfx-editor/releases/latest/download/vfx_editor.exe";
 const ABOUT_FEATURES: &[(&str, &str)] = &[
     ("Yakınlaştır", "Zoom in"),
     ("Uzaklaştır", "Zoom out"),
@@ -124,13 +126,16 @@ fn load_icon() -> IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png")
 }
 
-fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>) {
+fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, bool) {
     let mut open = None;
     let mut shots = None;
+    let mut updated = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         if a == "--intro-shots" {
             shots = args.next().map(PathBuf::from);
+        } else if a == "--updated" {
+            updated = true;
         } else {
             let p = PathBuf::from(a);
             if !p.to_string_lossy().starts_with('-') {
@@ -138,11 +143,11 @@ fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>) {
             }
         }
     }
-    (open, shots)
+    (open, shots, updated)
 }
 
 fn main() -> eframe::Result {
-    let (open, shots) = parse_cli();
+    let (open, shots, updated) = parse_cli();
     let icon = load_icon();
     let size = if shots.is_some() {
         [1280.0, 800.0]
@@ -159,7 +164,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "VFX Player",
         options,
-        Box::new(move |cc| Ok(Box::new(PlayerApp::new(cc, &icon, open, shots)))),
+        Box::new(move |cc| Ok(Box::new(PlayerApp::new(cc, &icon, open, shots, updated)))),
     )
 }
 
@@ -271,6 +276,7 @@ struct PlayerApp {
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     update_rx: Option<mpsc::Receiver<Option<String>>>,
     update_url: Option<String>,
+    update_modal: Option<UpdateModal>,
     about_open: bool,
     volume: f32,
     dark: bool,
@@ -292,6 +298,12 @@ struct IntroShots {
     requested: bool,
 }
 
+enum UpdateModal {
+    Busy(String),
+    Fail(String),
+    Done,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum RangeDrag {
     Create { origin: u64 },
@@ -305,6 +317,7 @@ impl PlayerApp {
         icon: &IconData,
         pending_open: Option<PathBuf>,
         intro_dir: Option<PathBuf>,
+        from_update: bool,
     ) -> Self {
         let logo = cc.egui_ctx.load_texture(
             "logo",
@@ -365,6 +378,7 @@ impl PlayerApp {
             export: None,
             update_rx: None,
             update_url: None,
+            update_modal: None,
             about_open: false,
             volume: 1.0,
             dark,
@@ -378,6 +392,10 @@ impl PlayerApp {
             focus: false,
         };
         if app.intro.is_none() {
+            let marked = take_just_updated();
+            if from_update || marked {
+                app.update_modal = Some(UpdateModal::Done);
+            }
             app.spawn_update_check();
             if let Some(p) = app.pending_open.take() {
                 app.open_path(p, &cc.egui_ctx);
@@ -717,6 +735,108 @@ impl PlayerApp {
         self.update_rx = Some(rx);
     }
 
+    fn begin_update(&mut self) {
+        let Some(tag) = self.update_url.take() else {
+            return;
+        };
+        let lang = self.lang();
+        let _ = std::fs::remove_file(update_state_path());
+        match spawn_self_update() {
+            Ok(()) => {
+                let _ = std::fs::create_dir_all(bundle::data_dir());
+                let _ = std::fs::write(just_updated_path(), "1");
+                self.status = lang
+                    .tr("Güncelleme indiriliyor…", "Downloading update…")
+                    .into();
+                self.update_modal = Some(UpdateModal::Busy(tag));
+            }
+            Err(e) => {
+                self.update_url = Some(tag);
+                self.status = e.clone();
+                self.update_modal = Some(UpdateModal::Fail(e));
+            }
+        }
+    }
+
+    fn poll_update_state(&mut self, ctx: &egui::Context) {
+        let Some(UpdateModal::Busy(tag)) = &self.update_modal else {
+            return;
+        };
+        ctx.request_repaint();
+        let Ok(s) = std::fs::read_to_string(update_state_path()) else {
+            return;
+        };
+        if s.trim() != "fail" {
+            return;
+        }
+        let _ = std::fs::remove_file(update_state_path());
+        let _ = std::fs::remove_file(just_updated_path());
+        let tag = tag.clone();
+        self.update_url = Some(tag);
+        let msg = self
+            .lang()
+            .tr("İndirme başarısız", "Download failed")
+            .to_string();
+        self.status = msg.clone();
+        self.update_modal = Some(UpdateModal::Fail(msg));
+    }
+
+    fn show_update_modal(&mut self, ctx: &egui::Context) {
+        if self.lang.is_none() {
+            return;
+        }
+        let lang = self.lang();
+        let Some(kind) = &self.update_modal else {
+            return;
+        };
+        let mut close = false;
+        egui::Window::new(lang.tr("Güncelleme", "Update"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                match kind {
+                    UpdateModal::Busy(tag) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(lang.tr(
+                                "Yeni sürüm indiriliyor…",
+                                "Downloading the new version…",
+                            ));
+                        });
+                        ui.add_space(6.0);
+                        ui.strong(tag);
+                        ui.weak(lang.tr(
+                            "Uygulama kapanıp yeniden açılacak.",
+                            "The app will close and reopen.",
+                        ));
+                    }
+                    UpdateModal::Fail(e) => {
+                        ui.label(lang.tr("Güncelleme başarısız", "Update failed"));
+                        ui.weak(e);
+                        ui.add_space(8.0);
+                        if ui.button(lang.tr("Tamam", "OK")).clicked() {
+                            close = true;
+                        }
+                    }
+                    UpdateModal::Done => {
+                        ui.heading(lang.tr("Güncellendi", "Updated"));
+                        ui.add_space(4.0);
+                        ui.label(lang.tr("Başarılı.", "Success."));
+                        ui.strong(format!("VFX Player v{APP_VERSION}"));
+                        ui.add_space(8.0);
+                        if ui.button(lang.tr("Tamam", "OK")).clicked() {
+                            close = true;
+                        }
+                    }
+                }
+            });
+        if close {
+            self.update_modal = None;
+        }
+    }
+
     fn poll_update(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.update_rx else {
             return;
@@ -818,19 +938,19 @@ impl PlayerApp {
                     {
                         open_browser(REPO_RELEASES);
                     }
-                    if let Some(url) = &self.update_url {
+                    if self.update_url.is_some() {
                         if ui
                             .add(
                                 egui::Button::new(lang.tr("Güncelle", "Update"))
                                     .fill(Color32::from_rgb(32, 140, 120)),
                             )
                             .on_hover_text(lang.tr(
-                                "Yeni sürümü GitHub’da aç",
-                                "Open the new release on GitHub",
+                                "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
+                                "Download, replace this exe, relaunch with the same args",
                             ))
                             .clicked()
                         {
-                            open_browser(url);
+                            self.begin_update();
                         }
                     }
                 });
@@ -1119,7 +1239,9 @@ impl eframe::App for PlayerApp {
         self.poll_fetch(ctx);
         self.poll_export(ctx);
         self.poll_update(ctx);
+        self.poll_update_state(ctx);
         self.show_about(ctx);
+        self.show_update_modal(ctx);
         if self.intro.is_none() {
             if let Some(p) = self.pending_open.take() {
                 self.open_path(p, ctx);
@@ -1285,18 +1407,18 @@ impl eframe::App for PlayerApp {
                     {
                         self.wave_on = !self.wave_on;
                     }
-                    if let Some(url) = &self.update_url {
+                    if self.update_url.is_some() {
                         if ui
                             .add(egui::Button::new(lang.tr("Güncelle", "Update")).fill(
                                 Color32::from_rgb(32, 140, 120),
                             ))
                             .on_hover_text(lang.tr(
-                                "Yeni sürümü GitHub’da aç",
-                                "Open the new release on GitHub",
+                                "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
+                                "Download, replace this exe, relaunch with the same args",
                             ))
                             .clicked()
                         {
-                            open_browser(url);
+                            self.begin_update();
                         }
                     }
                     if ui
@@ -1932,7 +2054,7 @@ fn latest_update_url() -> Option<String> {
     if parse_ver(&tag) <= parse_ver(APP_VERSION) {
         return None;
     }
-    Some(json_quoted(&body, "html_url").unwrap_or_else(|| REPO_RELEASES.into()))
+    Some(tag)
 }
 
 fn open_browser(url: &str) {
@@ -1940,6 +2062,87 @@ fn open_browser(url: &str) {
         .args(["/C", "start", "", url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
+}
+
+fn update_state_path() -> PathBuf {
+    std::env::temp_dir().join("vfx-editor").join("update_state.txt")
+}
+
+fn just_updated_path() -> PathBuf {
+    bundle::data_dir().join("just_updated")
+}
+
+fn take_just_updated() -> bool {
+    let p = just_updated_path();
+    if !p.is_file() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&p);
+    true
+}
+
+fn spawn_self_update() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dest = exe.to_str().ok_or("exe path")?;
+    let dir = std::env::temp_dir().join("vfx-editor");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("tmp: {e}"))?;
+    let _ = std::fs::create_dir_all(bundle::data_dir());
+    let script = dir.join("update.ps1");
+    let args_file = dir.join("update_args.txt");
+    let extra: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--updated")
+        .collect();
+    std::fs::write(&args_file, extra.join("\n")).map_err(|e| format!("tmp: {e}"))?;
+    std::fs::write(
+        &script,
+        format!(
+            r#"param($AppPid, $Dest, $ArgsFile)
+$st = Join-Path $env:TEMP 'vfx-editor\update_state.txt'
+$flag = Join-Path $env:LOCALAPPDATA 'vfx-editor\just_updated'
+$tmp = Join-Path $env:TEMP 'vfx-editor\vfx_editor_update.exe'
+New-Item -ItemType Directory -Force (Split-Path $tmp) | Out-Null
+& curl.exe -fsSL --max-redirs 5 -o $tmp -- '{url}'
+if (-not $? -or -not (Test-Path $tmp) -or (Get-Item $tmp).Length -lt 1MB) {{ Set-Content -LiteralPath $st 'fail'; exit 1 }}
+New-Item -ItemType Directory -Force (Split-Path $flag) | Out-Null
+Set-Content -LiteralPath $flag '1'
+& taskkill /PID $AppPid /T /F | Out-Null
+$ok = $false
+foreach ($i in 1..50) {{
+  Start-Sleep -Milliseconds 200
+  try {{ Copy-Item -LiteralPath $tmp -Destination $Dest -Force; $ok = $true; break }} catch {{}}
+}}
+$run = if ($ok) {{ $Dest }} else {{ $tmp }}
+$extra = @('--updated')
+if ($ArgsFile -and (Test-Path -LiteralPath $ArgsFile)) {{
+  $extra += @(Get-Content -LiteralPath $ArgsFile -Encoding utf8 | Where-Object {{ $_ -ne '' -and $_ -ne '--updated' }})
+}}
+Start-Process -FilePath $run -ArgumentList $extra
+"#,
+            url = EXE_DOWNLOAD
+        ),
+    )
+    .map_err(|e| format!("tmp: {e}"))?;
+    let runner = dir.join("run_update.cmd");
+    std::fs::write(
+        &runner,
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" -AppPid {} -Dest \"{}\" -ArgsFile \"{}\"\r\n",
+            script.display(),
+            std::process::id(),
+            dest,
+            args_file.display()
+        ),
+    )
+    .map_err(|e| format!("tmp: {e}"))?;
+    // start /B: updater must not be our child or taskkill /T kills it too
+    Command::new("cmd")
+        .args(["/C", "start", "", "/B"])
+        .arg(&runner)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn url_ext(url: &str) -> &'static str {
