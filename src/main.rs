@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, FontId, IconData, Key, Modifiers, Pos2, Rect,
     Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -44,7 +44,10 @@ const ABOUT_FEATURES: &[(&str, &str)] = &[
     ("Ses %0–125, %100 üstü boost", "Volume 0–125%, boost above 100%"),
     ("Döngü (I/O, Shift+sürükle)", "Loop (I/O, Shift+drag)"),
     ("Döngüyü aynı formatta kırp ve kaydet", "Trim loop and save (same format)"),
-    ("Dosya, sürükle-bırak, URL", "File, drop, or URL"),
+    (
+        "YouTube / Instagram / TikTok / Facebook / X / Reddit (kalite seç)",
+        "YouTube / Instagram / TikTok / Facebook / X / Reddit (pick quality)",
+    ),
     ("Exe üzerine bırakarak aç", "Open by dropping a file on the exe"),
     ("TR / EN", "TR / EN"),
     ("Koyu / açık tema", "Dark / light theme"),
@@ -272,7 +275,8 @@ struct PlayerApp {
     range_drag: Option<RangeDrag>,
     lang: Option<Lang>,
     url: String,
-    fetch: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    fetch: Option<mpsc::Receiver<FetchEvent>>,
+    format_pick: Option<(String, Vec<FormatOpt>)>,
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     update_rx: Option<mpsc::Receiver<Option<String>>>,
     update_url: Option<String>,
@@ -296,6 +300,19 @@ struct IntroShots {
     wait: u8,
     capture: Option<&'static str>,
     requested: bool,
+}
+
+enum FetchEvent {
+    Status(String),
+    Formats(String, Vec<FormatOpt>),
+    Done(Result<PathBuf, String>),
+}
+
+#[derive(Clone)]
+struct FormatOpt {
+    label: String,
+    spec: String,
+    merge: &'static str,
 }
 
 enum UpdateModal {
@@ -375,6 +392,7 @@ impl PlayerApp {
             lang,
             url: String::new(),
             fetch: None,
+            format_pick: None,
             export: None,
             update_rx: None,
             update_url: None,
@@ -639,34 +657,81 @@ impl PlayerApp {
             return;
         }
         let lang = self.lang();
+        if !url_allowed(&url) {
+            self.status = lang
+                .tr(
+                    "Desteklenen: YouTube, Shorts, Instagram, TikTok, Facebook, X, Reddit",
+                    "Supported: YouTube, Shorts, Instagram, TikTok, Facebook, X, Reddit",
+                )
+                .into();
+            return;
+        }
+        self.format_pick = None;
+        self.status = lang.tr("Çıkarılıyor…", "Extracting…").into();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            match list_formats(&url, lang, &tx) {
+                Ok(opts) => {
+                    let _ = tx.send(FetchEvent::Formats(url, opts));
+                }
+                Err(e) => {
+                    let _ = tx.send(FetchEvent::Done(Err(e)));
+                }
+            }
+        });
+        self.fetch = Some(rx);
+    }
+
+    fn start_format_download(&mut self, url: String, spec: String, merge: &'static str) {
+        if self.fetch.is_some() {
+            return;
+        }
+        let lang = self.lang();
+        let ffmpeg = self.ffmpeg.clone().ok();
+        self.format_pick = None;
         self.status = lang.tr("İndiriliyor…", "Downloading…").into();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(download_url(&url, lang));
+            let r = download_ytdlp(&url, lang, ffmpeg.as_deref(), &spec, merge, &tx);
+            let _ = tx.send(FetchEvent::Done(r));
         });
         self.fetch = Some(rx);
     }
 
     fn poll_fetch(&mut self, ctx: &egui::Context) {
-        let msg = {
-            let Some(rx) = &self.fetch else {
-                return;
-            };
+        let Some(rx) = &self.fetch else {
+            return;
+        };
+        loop {
             match rx.try_recv() {
-                Ok(v) => v,
+                Ok(FetchEvent::Status(s)) => {
+                    self.status = s;
+                    ctx.request_repaint();
+                }
+                Ok(FetchEvent::Formats(url, opts)) => {
+                    self.fetch = None;
+                    self.status = self.lang().tr("Kalite seç", "Pick a quality").into();
+                    self.format_pick = Some((url, opts));
+                    return;
+                }
+                Ok(FetchEvent::Done(v)) => {
+                    self.fetch = None;
+                    match v {
+                        Ok(path) => self.open_path(path, ctx),
+                        Err(e) => self.status = e,
+                    }
+                    return;
+                }
                 Err(mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint();
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    Err(self.lang().tr("İndirme kesildi", "Download failed").into())
+                    self.fetch = None;
+                    self.status = self.lang().tr("İndirme kesildi", "Download failed").into();
+                    return;
                 }
             }
-        };
-        self.fetch = None;
-        match msg {
-            Ok(path) => self.open_path(path, ctx),
-            Err(e) => self.status = e,
         }
     }
 
@@ -834,6 +899,51 @@ impl PlayerApp {
             });
         if close {
             self.update_modal = None;
+        }
+    }
+
+    fn show_format_modal(&mut self, ctx: &egui::Context) {
+        if self.lang.is_none() {
+            return;
+        }
+        let lang = self.lang();
+        let Some((_, formats)) = &self.format_pick else {
+            return;
+        };
+        let mut pick: Option<FormatOpt> = None;
+        let mut cancel = false;
+        egui::Window::new(lang.tr("Kalite", "Quality"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                ui.strong(lang.tr("Mevcut formatlar", "Available formats"));
+                ui.weak("↓");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for f in formats {
+                            if ui
+                                .add_sized([260.0, 28.0], egui::Button::new(&f.label))
+                                .clicked()
+                            {
+                                pick = Some(f.clone());
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+                if ui.button(lang.tr("Vazgeç", "Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        if cancel {
+            self.format_pick = None;
+            self.status = lang.tr("Video aç", "Open a video").into();
+        } else if let Some(f) = pick {
+            let url = self.format_pick.as_ref().map(|(u, _)| u.clone()).unwrap();
+            self.start_format_download(url, f.spec, f.merge);
         }
     }
 
@@ -1242,6 +1352,7 @@ impl eframe::App for PlayerApp {
         self.poll_update_state(ctx);
         self.show_about(ctx);
         self.show_update_modal(ctx);
+        self.show_format_modal(ctx);
         if self.intro.is_none() {
             if let Some(p) = self.pending_open.take() {
                 self.open_path(p, ctx);
@@ -1361,8 +1472,8 @@ impl eframe::App for PlayerApp {
                                 .hint_text(url_hint),
                         )
                         .on_hover_text(lang.tr(
-                            "Videoyu URL’den indir",
-                            "Download a video from a URL",
+                            "YouTube, Instagram, TikTok, Facebook, X, Reddit",
+                            "YouTube, Instagram, TikTok, Facebook, X, Reddit",
                         ));
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         self.start_url();
@@ -2022,6 +2133,70 @@ fn parse_ver(s: &str) -> (u64, u64, u64) {
     (a, b, c)
 }
 
+fn json_u32(body: &str, key: &str) -> Option<u32> {
+    json_f32(body, key).map(|n| n as u32)
+}
+
+fn json_f32(body: &str, key: &str) -> Option<f32> {
+    let pat = format!("\"{key}\"");
+    let i = body.find(&pat)?;
+    let rest = body[i + pat.len()..].trim_start().trim_start_matches(':').trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    num.parse().ok()
+}
+
+fn json_top_objects(s: &str) -> Vec<&str> {
+    let s = s.trim();
+    let s = s.strip_prefix('[').unwrap_or(s);
+    let s = s.strip_suffix(']').unwrap_or(s);
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+                continue;
+            }
+            if c == '\\' {
+                esc = true;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(a) = start {
+                        out.push(&s[a..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn json_quoted(body: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\"");
     let i = body.find(&pat)?;
@@ -2145,6 +2320,7 @@ Start-Process -FilePath $run -ArgumentList $extra
     Ok(())
 }
 
+#[cfg(test)]
 fn url_ext(url: &str) -> &'static str {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let ext = Path::new(path)
@@ -2158,31 +2334,361 @@ fn url_ext(url: &str) -> &'static str {
         .unwrap_or("mp4")
 }
 
-fn download_url(url: &str, lang: Lang) -> Result<PathBuf, String> {
-    let url = url.trim();
+fn url_allowed(url: &str) -> bool {
+    let Some(rest) = url.split("://").nth(1) else {
+        return false;
+    };
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(lang.tr("http(s) URL gir", "Enter an http(s) URL").into());
+        return false;
     }
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    const HOSTS: &[&str] = &[
+        "youtube.com",
+        "youtu.be",
+        "m.youtube.com",
+        "music.youtube.com",
+        "instagram.com",
+        "tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+        "facebook.com",
+        "fb.com",
+        "fb.watch",
+        "m.facebook.com",
+        "x.com",
+        "twitter.com",
+        "mobile.twitter.com",
+        "reddit.com",
+        "old.reddit.com",
+        "v.redd.it",
+    ];
+    HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+fn codec_v(s: &str) -> Option<&'static str> {
+    let s = s.to_ascii_lowercase();
+    if s.is_empty() || s == "none" {
+        return None;
+    }
+    Some(if s.starts_with("avc") || s.contains("h264") {
+        "H264"
+    } else if s.starts_with("vp9") || s.starts_with("vp09") {
+        "VP9"
+    } else if s.starts_with("av01") || s.starts_with("av1") {
+        "AV1"
+    } else if s.starts_with("hev") || s.starts_with("hvc") || s.contains("h265") {
+        "H265"
+    } else {
+        "Video"
+    })
+}
+
+fn codec_a(s: &str) -> Option<&'static str> {
+    let s = s.to_ascii_lowercase();
+    if s.is_empty() || s == "none" {
+        return None;
+    }
+    Some(if s.starts_with("mp4a") || s.contains("aac") {
+        "AAC"
+    } else if s.contains("opus") {
+        "Opus"
+    } else if s.contains("mp3") {
+        "MP3"
+    } else {
+        "Audio"
+    })
+}
+
+fn is_none_codec(s: &str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case("none")
+}
+
+fn list_formats(
+    url: &str,
+    lang: Lang,
+    tx: &mpsc::Sender<FetchEvent>,
+) -> Result<Vec<FormatOpt>, String> {
+    let _ = tx.send(FetchEvent::Status(
+        lang.tr("Çıkarılıyor…", "Extracting…").into(),
+    ));
+    let ytdlp = bundle::extract_ytdlp()?;
+    let out = Command::new(&ytdlp)
+        .args([
+            "--skip-download",
+            "--no-playlist",
+            "--no-warnings",
+            "--print",
+            "%(formats)j",
+            "--",
+            url,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("yt-dlp: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERROR") || !l.trim().is_empty())
+            .unwrap_or("");
+        return Err(if line.is_empty() {
+            lang.tr("Çıkarma başarısız", "Extract failed").into()
+        } else {
+            line.to_string()
+        });
+    }
+    let json = String::from_utf8_lossy(&out.stdout);
+    let opts = build_format_opts(&json);
+    if opts.is_empty() {
+        return Err(lang.tr("Format yok", "No formats").into());
+    }
+    Ok(opts)
+}
+
+fn build_format_opts(json: &str) -> Vec<FormatOpt> {
+    struct Raw {
+        id: String,
+        height: u32,
+        vcodec: String,
+        acodec: String,
+        tbr: f32,
+        note: String,
+    }
+    let mut raw = Vec::new();
+    for obj in json_top_objects(json) {
+        let Some(id) = json_quoted(obj, "format_id") else {
+            continue;
+        };
+        let proto = json_quoted(obj, "protocol").unwrap_or_default();
+        if proto.contains("mhtml") || proto.contains("storyboard") {
+            continue;
+        }
+        let ext = json_quoted(obj, "ext").unwrap_or_default();
+        if matches!(ext.as_str(), "mhtml" | "jpg" | "png" | "webp") {
+            continue;
+        }
+        let vcodec = json_quoted(obj, "vcodec").unwrap_or_else(|| "none".into());
+        let acodec = json_quoted(obj, "acodec").unwrap_or_else(|| "none".into());
+        if is_none_codec(&vcodec) && is_none_codec(&acodec) {
+            continue;
+        }
+        raw.push(Raw {
+            id,
+            height: json_u32(obj, "height").unwrap_or(0),
+            vcodec,
+            acodec,
+            tbr: json_f32(obj, "tbr")
+                .or_else(|| json_f32(obj, "vbr"))
+                .unwrap_or(0.0),
+            note: json_quoted(obj, "format_note").unwrap_or_default(),
+        });
+    }
+    let mut audios: Vec<&Raw> = raw
+        .iter()
+        .filter(|f| is_none_codec(&f.vcodec) && !is_none_codec(&f.acodec))
+        .collect();
+    audios.sort_by(|a, b| b.tbr.partial_cmp(&a.tbr).unwrap_or(std::cmp::Ordering::Equal));
+    let best_audio = |want: &str| -> Option<&Raw> {
+        audios
+            .iter()
+            .copied()
+            .find(|a| codec_a(&a.acodec) == Some(want))
+            .or_else(|| audios.first().copied())
+    };
+    let mut best: Vec<&Raw> = Vec::new();
+    for v in &raw {
+        if v.height == 0 || codec_v(&v.vcodec).is_none() {
+            continue;
+        }
+        if let Some(old) = best.iter_mut().find(|o| {
+            o.height == v.height && codec_v(&o.vcodec) == codec_v(&v.vcodec)
+        }) {
+            if v.tbr > old.tbr {
+                *old = v;
+            }
+        } else {
+            best.push(v);
+        }
+    }
+    best.sort_by(|a, b| b.height.cmp(&a.height));
+    let mut opts = Vec::new();
+    for v in best {
+        let vn = codec_v(&v.vcodec).unwrap_or("Video");
+        let (spec, an) = if !is_none_codec(&v.acodec) {
+            (v.id.clone(), codec_a(&v.acodec).unwrap_or("Audio"))
+        } else if let Some(a) = best_audio(if vn == "H264" { "AAC" } else { "Opus" }) {
+            (
+                format!("{}+{}", v.id, a.id),
+                codec_a(&a.acodec).unwrap_or("Audio"),
+            )
+        } else {
+            (v.id.clone(), "—")
+        };
+        let mut label = if an == "—" {
+            format!("{}p {vn}", v.height)
+        } else {
+            format!("{}p {vn} + {an}", v.height)
+        };
+        if v.note.to_ascii_uppercase().contains("HDR") {
+            label.push_str(" HDR");
+        }
+        if opts.iter().any(|o: &FormatOpt| o.label == label) {
+            continue;
+        }
+        let merge = if vn == "H264" && an == "AAC" {
+            "mp4"
+        } else {
+            "mkv"
+        };
+        opts.push(FormatOpt { label, spec, merge });
+        if opts.len() >= 16 {
+            break;
+        }
+    }
+    opts
+}
+
+fn download_ytdlp(
+    url: &str,
+    lang: Lang,
+    ffmpeg: Option<&Path>,
+    spec: &str,
+    merge: &str,
+    tx: &mpsc::Sender<FetchEvent>,
+) -> Result<PathBuf, String> {
+    let ytdlp = bundle::extract_ytdlp()?;
     let dir = std::env::temp_dir().join("vfx-editor");
     std::fs::create_dir_all(&dir).map_err(|e| format!("tmp: {e}"))?;
-    let dest = dir.join(format!("clip.{}", url_ext(url)));
-    let ok = Command::new("curl")
-        .args(["-fsSL", "--max-redirs", "5", "-o"])
-        .arg(&dest)
-        .arg("--")
-        .arg(url)
+    let stem = format!(
+        "dl{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let out = dir.join(format!("{stem}.%(ext)s"));
+    let mut cmd = Command::new(&ytdlp);
+    cmd.args([
+        "--no-playlist",
+        "--newline",
+        "--no-mtime",
+        "--restrict-filenames",
+        "-f",
+        spec,
+        "--merge-output-format",
+        merge,
+        "-o",
+    ])
+    .arg(&out);
+    if let Some(ff) = ffmpeg {
+        cmd.arg("--ffmpeg-location").arg(ff);
+    }
+    cmd.arg("--").arg(url);
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|e| format!("curl: {e}"))?
-        .success();
+        .spawn()
+        .map_err(|e| format!("yt-dlp: {e}"))?;
+    let mut last_err = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("ERROR") {
+                last_err = line.clone();
+            }
+            if let Some(s) = ytdlp_status(&line, lang) {
+                let _ = tx.send(FetchEvent::Status(s));
+            }
+        }
+    }
+    let ok = child.wait().map_err(|e| e.to_string())?.success();
     if !ok {
-        return Err(lang.tr("İndirme başarısız", "Download failed").into());
+        if last_err.is_empty() {
+            return Err(lang.tr("İndirme başarısız", "Download failed").into());
+        }
+        return Err(last_err);
     }
-    if dest.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        return Err(lang.tr("Boş indirme", "Empty download").into());
-    }
-    Ok(dest)
+    find_download(&dir, &stem).ok_or_else(|| lang.tr("Boş indirme", "Empty download").into())
 }
+
+fn ytdlp_status(line: &str, lang: Lang) -> Option<String> {
+    let line = line.trim();
+    if let Some(p) = download_pct(line) {
+        let mut s = format!("{} {p}%", lang.tr("İndiriliyor", "Downloading"));
+        if let Some(eta) = line.split("ETA ").nth(1) {
+            let eta = eta.split_whitespace().next().unwrap_or("");
+            if !eta.is_empty() {
+                s.push_str(" · ");
+                s.push_str(eta);
+            }
+        }
+        return Some(s);
+    }
+    if line.contains("[Merger]") || line.contains("[Fixup]") || line.contains("[ExtractAudio]") {
+        return Some(lang.tr("Birleştiriliyor…", "Merging…").into());
+    }
+    if line.contains("Extracting")
+        || line.contains("Downloading webpage")
+        || line.contains("Downloading player")
+        || line.contains("[info]")
+    {
+        return Some(lang.tr("Çıkarılıyor…", "Extracting…").into());
+    }
+    if line.starts_with("[download]") {
+        return Some(lang.tr("İndiriliyor…", "Downloading…").into());
+    }
+    None
+}
+
+fn download_pct(line: &str) -> Option<u32> {
+    let (left, _) = line.split_once('%')?;
+    let n = left.split_whitespace().last()?;
+    n.parse::<f32>().ok().map(|p| p.clamp(0.0, 100.0) as u32)
+}
+
+fn find_download(dir: &Path, stem: &str) -> Option<PathBuf> {
+    for ext in ["mp4", "mkv", "webm", "mov"] {
+        let p = dir.join(format!("{stem}.{ext}"));
+        if p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    let mut best: Option<(u64, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()? {
+        let e = e.ok()?;
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(stem) || name.contains(".part") || name.ends_with(".ytdl") {
+            continue;
+        }
+        let ext = Path::new(name.as_ref())
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())?;
+        if !VIDEO_EXTS.iter().any(|v| *v == ext) {
+            continue;
+        }
+        let len = e.metadata().ok()?.len();
+        if len == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(n, _)| len > *n).unwrap_or(true) {
+            best = Some((len, e.path()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 
 #[derive(Clone, Copy)]
 struct TimeView {

@@ -1,6 +1,6 @@
 [package]
 name = "vfx_editor"
-version = "0.1.2"
+version = "1.2.3"
 edition = "2024"
 description = "Frame-accurate video player"
 repository = "https://github.com/GroophyLifefor/vfx-editor"

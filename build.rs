@@ -11,26 +11,30 @@ fn main() {
     let ffmpeg = find_ffmpeg();
     println!("cargo:rerun-if-changed={}", ffmpeg.display());
     println!("cargo:rerun-if-env-changed=FFMPEG_EXE");
+    pack_exe(&ffmpeg, "ffmpeg.exe.zst", "FFMPEG_UNCOMPRESSED_SIZE");
 
-    let meta = fs::metadata(&ffmpeg).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}", ffmpeg.display());
+    let ytdlp = find_ytdlp();
+    println!("cargo:rerun-if-changed={}", ytdlp.display());
+    println!("cargo:rerun-if-env-changed=YTDLP_EXE");
+    pack_exe(&ytdlp, "yt-dlp.exe.zst", "YTDLP_UNCOMPRESSED_SIZE");
+}
+
+fn pack_exe(src: &Path, zst_name: &str, size_env: &str) {
+    let meta = fs::metadata(src).unwrap_or_else(|e| {
+        panic!("cannot read {}: {e}", src.display());
     });
     if meta.len() < 1_000_000 {
         panic!(
-            "ffmpeg at {} is {} bytes (shim/link?). Set FFMPEG_EXE to the real ffmpeg.exe",
-            ffmpeg.display(),
+            "{} is {} bytes (shim/link?). Set the real exe path.",
+            src.display(),
             meta.len()
         );
     }
-
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let zst = out.join("ffmpeg.exe.zst");
-    let src = fs::read(&ffmpeg).unwrap_or_else(|e| panic!("read ffmpeg: {e}"));
-    let compressed = zstd::encode_all(src.as_slice(), 8).unwrap_or_else(|e| panic!("zstd: {e}"));
+    let zst = PathBuf::from(env::var("OUT_DIR").unwrap()).join(zst_name);
+    let bytes = fs::read(src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+    let compressed = zstd::encode_all(bytes.as_slice(), 8).unwrap_or_else(|e| panic!("zstd: {e}"));
     fs::write(&zst, compressed).unwrap_or_else(|e| panic!("write zst: {e}"));
-
-    println!("cargo:rustc-env=FFMPEG_UNCOMPRESSED_SIZE={}", meta.len());
-    println!("cargo:rustc-env=FFMPEG_SRC={}", ffmpeg.display());
+    println!("cargo:rustc-env={size_env}={}", meta.len());
 }
 
 fn find_ffmpeg() -> PathBuf {
@@ -54,6 +58,41 @@ fn find_ffmpeg() -> PathBuf {
     panic!(
         "ffmpeg on PATH is a shim. Set FFMPEG_EXE to the real ffmpeg.exe"
     );
+}
+
+fn find_ytdlp() -> PathBuf {
+    if let Ok(p) = env::var("YTDLP_EXE") {
+        return resolve(Path::new(&p));
+    }
+    if let Ok(output) = Command::new("where").arg("yt-dlp").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                let p = resolve(Path::new(line));
+                if fs::metadata(&p).map(|m| m.len() >= 1_000_000).unwrap_or(false) {
+                    return p;
+                }
+            }
+        }
+    }
+    let dest = PathBuf::from(env::var("OUT_DIR").unwrap()).join("yt-dlp.exe");
+    if dest.metadata().map(|m| m.len() >= 1_000_000).unwrap_or(false) {
+        return dest;
+    }
+    let ok = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-o",
+        ])
+        .arg(&dest)
+        .arg("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || dest.metadata().map(|m| m.len() < 1_000_000).unwrap_or(true) {
+        panic!("yt-dlp missing. Install it or set YTDLP_EXE, or allow curl to GitHub.");
+    }
+    dest
 }
 
 fn resolve(path: &Path) -> PathBuf {

@@ -1,6 +1,6 @@
 # VFX Player
 
-**Advanced Video Player for VFX Experts** — v0.1.2. Frame-accurate review, not a consumer player. No installer.
+**Advanced Video Player for VFX Experts** — v1.2.3. Frame-accurate review, not a consumer player. No installer.
 
 [![Download](https://img.shields.io/github/v/release/GroophyLifefor/vfx-editor?label=Download)](https://github.com/GroophyLifefor/vfx-editor/releases/latest)
 
@@ -14,7 +14,7 @@
 2. Run it. First launch asks **Türkçe / English**.
 3. Open a video.
 
-Windows exe. FFmpeg is bundled. That is the whole install.
+Windows exe. FFmpeg and yt-dlp are bundled. That is the whole install.
 
 Windows SmartScreen may warn on the first run (unsigned build). Choose **More info → Run anyway**.
 
@@ -23,7 +23,7 @@ Windows SmartScreen may warn on the first run (unsigned build). Choose **More in
 - **Open** in the app
 - Drop a video on the window
 - Drop a video **on the exe** (or Open with)
-- Paste an `http(s)` URL and **Open URL**
+- Paste a **YouTube, Shorts, Instagram, TikTok, Facebook, X, or Reddit** URL and **Open URL**, then pick quality
 
 ## Features
 

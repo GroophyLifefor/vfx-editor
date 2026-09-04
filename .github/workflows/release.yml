@@ -63,5 +63,5 @@ jobs:
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" "target/release/vfx_editor.exe" `
             --title "${{ steps.ver.outputs.name }}" `
-            --notes "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg is bundled." `
+            --notes "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg and yt-dlp are bundled." `
             --latest
