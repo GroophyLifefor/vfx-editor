@@ -13,35 +13,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install ffmpeg
-        run: choco install ffmpeg -y --no-progress
-
-      - name: Build
-        run: cargo build --release
-
       - name: Version tag
         id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           if ($v -match '^(\d+)\.(\d+)\.0$') { $tag = "v$($Matches[1]).$($Matches[2])" }
           else { $tag = "v$v" }
+          $exists = $false
+          if (gh release view $tag --json id 2>$null) { $exists = $true }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "name=VFX Player $tag" >> $env:GITHUB_OUTPUT
+          "exists=$exists" >> $env:GITHUB_OUTPUT
+          if ($exists) { Write-Host "Release $tag already exists — skip" }
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ver.outputs.exists != 'true'
+
+      - name: Install ffmpeg
+        if: steps.ver.outputs.exists != 'true'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Build
+        if: steps.ver.outputs.exists != 'true'
+        run: cargo build --release
 
       - name: Publish
+        if: steps.ver.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $exe = "target/release/vfx_editor.exe"
-          $tag = "${{ steps.ver.outputs.tag }}"
-          $title = "${{ steps.ver.outputs.name }}"
-          $notes = "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg is bundled."
-          if (gh release view $tag --json id 2>$null) {
-            gh release upload $tag $exe --clobber
-          } else {
-            gh release create $tag $exe --title $title --notes $notes --latest
-          }
+          gh release create "${{ steps.ver.outputs.tag }}" "target/release/vfx_editor.exe" `
+            --title "${{ steps.ver.outputs.name }}" `
+            --notes "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg is bundled." `
+            --latest
