@@ -1,6 +1,6 @@
 # VFX Player
 
-**v0.1** — Windows video player for frame-accurate work. No installer.
+**Advanced Video Player for VFX Experts** — v0.1.1. Frame-accurate review, not a consumer player. No installer.
 
 [![Download](https://img.shields.io/github/v/release/GroophyLifefor/vfx-editor?label=Download)](https://github.com/GroophyLifefor/vfx-editor/releases/latest)
 
@@ -14,7 +14,7 @@
 2. Run it. First launch asks **Türkçe / English**.
 3. Open a video.
 
-That is the whole install. FFmpeg ships inside the exe.
+Windows exe. FFmpeg is bundled. That is the whole install.
 
 Windows SmartScreen may warn on the first run (unsigned build). Choose **More info → Run anyway**.
 
@@ -40,9 +40,9 @@ Windows SmartScreen may warn on the first run (unsigned build). Choose **More in
 
 ## Language
 
-| | |
+| Language | Description |
 |---|---|
 | TR | İlk açılışta dil seç. Exe’yi [Releases](https://github.com/GroophyLifefor/vfx-editor/releases/latest) sayfasından indir, kurulum yok. |
-| EN | Pick a language on first launch. Download the exe from [Releases](https://github.com/GroophyLifefor/vfx-editor/releases/latest) — no setup. |
+| EN | Pick a language on first launch. Download the exe from [Releases](https://github.com/GroophyLifefor/vfx-editor/releases/latest), no setup. |
 
 Made by [Murat Kirazkaya](https://github.com/GroophyLifefor)

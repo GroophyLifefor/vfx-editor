@@ -5,7 +5,7 @@ mod bundle;
 mod decoder;
 
 use audio::AudioTrack;
-use decoder::{export_span, format_time, Decoder};
+use decoder::{export_span, Decoder};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, FontId, IconData, Key, Modifiers, Pos2, Rect,
     Sense, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -24,6 +24,7 @@ const VIDEO_EXTS: &[&str] = &[
 ];
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ABOUT_URL: &str = "https://github.com/GroophyLifefor";
+const REPO_URL: &str = "https://github.com/GroophyLifefor/vfx-editor";
 const REPO_RELEASES: &str = "https://github.com/GroophyLifefor/vfx-editor/releases/latest";
 const REPO_API: &str =
     "https://api.github.com/repos/GroophyLifefor/vfx-editor/releases/latest";
@@ -46,6 +47,8 @@ const ABOUT_FEATURES: &[(&str, &str)] = &[
     ("TR / EN", "TR / EN"),
     ("Koyu / açık tema", "Dark / light theme"),
     ("Zaman çizelgesi zoom (saniye → kare)", "Timeline zoom (seconds → frames)"),
+    ("Odak modu (F)", "Focus mode (F)"),
+    ("Dalga formunu gizle / göster", "Show / hide waveform"),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -277,6 +280,8 @@ struct PlayerApp {
     tl_scroll: f32,
     wave_h: f32,
     bar_h: f32,
+    wave_on: bool,
+    focus: bool,
 }
 
 struct IntroShots {
@@ -369,6 +374,8 @@ impl PlayerApp {
             tl_scroll: 0.0,
             wave_h: 56.0,
             bar_h: 28.0,
+            wave_on: true,
+            focus: false,
         };
         if app.intro.is_none() {
             app.spawn_update_check();
@@ -753,33 +760,103 @@ impl PlayerApp {
         }
         let lang = self.lang();
         let title = lang.tr("Hakkında", "About");
+        let logo = self.logo.id();
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("about"),
             egui::ViewportBuilder::default()
                 .with_title(title)
-                .with_inner_size([440.0, 320.0])
-                .with_resizable(false)
+                .with_inner_size([480.0, 460.0])
+                .with_min_inner_size([400.0, 360.0])
                 .with_always_on_top()
                 .with_minimize_button(false)
                 .with_maximize_button(false),
             |ui, _class| {
-                ui.heading("VFX Player");
-                ui.label(format!("v{APP_VERSION}"));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.add(egui::Image::new((logo, egui::vec2(52.0, 52.0))));
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.heading("VFX Player");
+                        ui.weak(lang.tr(
+                            "VFX uzmanları için ileri video oynatıcı",
+                            "Advanced Video Player for VFX Experts",
+                        ));
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("v{APP_VERSION}"))
+                                .on_hover_text(lang.tr("Sürüm", "Version"));
+                            ui.weak("·");
+                            ui.weak("Windows");
+                        });
+                    });
+                });
+                ui.add_space(8.0);
                 ui.label(lang.tr(
                     "Murat Kirazkaya tarafından yapıldı",
                     "Made by Murat Kirazkaya",
                 ));
-                if ui.link(ABOUT_URL).clicked() {
-                    open_browser(ABOUT_URL);
-                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("GitHub")
+                        .on_hover_text(REPO_URL)
+                        .clicked()
+                    {
+                        open_browser(REPO_URL);
+                    }
+                    if ui
+                        .button(lang.tr("Profil", "Profile"))
+                        .on_hover_text(ABOUT_URL)
+                        .clicked()
+                    {
+                        open_browser(ABOUT_URL);
+                    }
+                    if ui
+                        .button(lang.tr("Sürümler", "Releases"))
+                        .on_hover_text(REPO_RELEASES)
+                        .clicked()
+                    {
+                        open_browser(REPO_RELEASES);
+                    }
+                    if let Some(url) = &self.update_url {
+                        if ui
+                            .add(
+                                egui::Button::new(lang.tr("Güncelle", "Update"))
+                                    .fill(Color32::from_rgb(32, 140, 120)),
+                            )
+                            .on_hover_text(lang.tr(
+                                "Yeni sürümü GitHub’da aç",
+                                "Open the new release on GitHub",
+                            ))
+                            .clicked()
+                        {
+                            open_browser(url);
+                        }
+                    }
+                });
+                ui.add_space(8.0);
                 ui.separator();
-                ui.strong(lang.tr("Özellikler", "Features"));
+                ui.add_space(6.0);
+                ui.strong(lang.tr("Ne yapar", "What it does"));
+                ui.add_space(4.0);
+                let groups: [(&str, &str, &[usize]); 4] = [
+                    ("İnceleme", "Review", &[0, 1, 2, 3, 4, 5, 6, 7, 18]),
+                    ("Zaman çizelgesi", "Timeline", &[8, 9, 10, 17, 19]),
+                    ("Döngü", "Loop", &[11, 12]),
+                    ("Uygulama", "App", &[13, 14, 15, 16]),
+                ];
                 egui::ScrollArea::vertical()
-                    .max_height(180.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (tr, en) in ABOUT_FEATURES {
-                            ui.label(format!("• {}", lang.tr(tr, en)));
+                        for (tr, en, idxs) in groups {
+                            ui.weak(lang.tr(tr, en));
+                            ui.add_space(2.0);
+                            for i in idxs {
+                                if let Some((a, b)) = ABOUT_FEATURES.get(*i) {
+                                    ui.label(format!("   {}", lang.tr(a, b)));
+                                }
+                            }
+                            ui.add_space(8.0);
                         }
                     });
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -977,7 +1054,18 @@ impl PlayerApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.decoder.is_none() || ctx.egui_wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::Escape) && self.focus {
+                self.focus = false;
+            }
+            if i.consume_key(Modifiers::NONE, Key::F) {
+                self.focus = !self.focus;
+            }
+        });
+        if self.decoder.is_none() {
             return;
         }
         let mut play = false;
@@ -1109,12 +1197,14 @@ impl eframe::App for PlayerApp {
                             ui.add_space((ui.available_width() - 220.0).max(0.0) * 0.5);
                             if ui
                                 .add_sized([100.0, 36.0], egui::Button::new("Türkçe"))
+                                .on_hover_text("Türkçe arayüz")
                                 .clicked()
                             {
                                 self.set_lang(Lang::Tr);
                             }
                             if ui
                                 .add_sized([100.0, 36.0], egui::Button::new("English"))
+                                .on_hover_text("English interface")
                                 .clicked()
                             {
                                 self.set_lang(Lang::En);
@@ -1126,36 +1216,83 @@ impl eframe::App for PlayerApp {
             return;
         }
         let lang = self.lang();
+        if !self.focus {
         egui::Panel::top("top").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add(egui::Image::new((self.logo.id(), egui::vec2(22.0, 22.0))));
-                if ui.button(lang.tr("Aç", "Open")).clicked() {
+                ui.add(egui::Image::new((self.logo.id(), egui::vec2(22.0, 22.0))))
+                    .on_hover_text("VFX Player");
+                if ui
+                    .button(lang.tr("Aç", "Open"))
+                    .on_hover_text(lang.tr("Video dosyası aç", "Open a video file"))
+                    .clicked()
+                {
                     self.pick_file(&ctx);
                 }
+                ui.separator();
                 let url_hint = lang.tr("https://…", "https://…");
                 let fetch_busy = self.fetch.is_some();
                 ui.add_enabled_ui(!fetch_busy, |ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.url)
-                            .desired_width(220.0)
-                            .hint_text(url_hint),
-                    );
+                    let resp = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.url)
+                                .desired_width(200.0)
+                                .hint_text(url_hint),
+                        )
+                        .on_hover_text(lang.tr(
+                            "Videoyu URL’den indir",
+                            "Download a video from a URL",
+                        ));
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         self.start_url();
                     }
-                    if ui.button(lang.tr("URL aç", "Open URL")).clicked() {
+                    if ui
+                        .button(lang.tr("URL aç", "Open URL"))
+                        .on_hover_text(lang.tr("Enter veya tıkla", "Enter or click"))
+                        .clicked()
+                    {
                         self.start_url();
                     }
                 });
-                ui.label(&self.status);
+                ui.separator();
+                ui.weak(&self.status)
+                    .on_hover_text(lang.tr("Açık dosya / durum", "Open file / status"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(lang.tr("Hakkında", "About")).clicked() {
+                    if ui
+                        .button(lang.tr("Hakkında", "About"))
+                        .on_hover_text(lang.tr("Uygulama bilgisi", "About this app"))
+                        .clicked()
+                    {
                         self.about_open = true;
+                    }
+                    if ui
+                        .button(lang.tr("Odak", "Focus"))
+                        .on_hover_text(lang.tr(
+                            "Sadece video, cetvel ve oynatma (F / Esc)",
+                            "Video, ruler and transport only (F / Esc)",
+                        ))
+                        .clicked()
+                    {
+                        self.focus = true;
+                    }
+                    if self.audio.is_some()
+                        && ui
+                            .selectable_label(self.wave_on, lang.tr("Dalga", "Wave"))
+                            .on_hover_text(lang.tr(
+                                "Ses dalgasını göster / gizle",
+                                "Show / hide the waveform",
+                            ))
+                            .clicked()
+                    {
+                        self.wave_on = !self.wave_on;
                     }
                     if let Some(url) = &self.update_url {
                         if ui
                             .add(egui::Button::new(lang.tr("Güncelle", "Update")).fill(
                                 Color32::from_rgb(32, 140, 120),
+                            ))
+                            .on_hover_text(lang.tr(
+                                "Yeni sürümü GitHub’da aç",
+                                "Open the new release on GitHub",
                             ))
                             .clicked()
                         {
@@ -1164,24 +1301,29 @@ impl eframe::App for PlayerApp {
                     }
                     if ui
                         .selectable_label(!self.dark, lang.tr("Açık", "Light"))
+                        .on_hover_text(lang.tr("Açık tema", "Light theme"))
                         .clicked()
                     {
                         self.set_dark(&ctx, false);
                     }
                     if ui
                         .selectable_label(self.dark, lang.tr("Koyu", "Dark"))
+                        .on_hover_text(lang.tr("Koyu tema", "Dark theme"))
                         .clicked()
                     {
                         self.set_dark(&ctx, true);
                     }
+                    ui.separator();
                     if ui
                         .selectable_label(self.lang == Some(Lang::En), "EN")
+                        .on_hover_text("English")
                         .clicked()
                     {
                         self.set_lang(Lang::En);
                     }
                     if ui
                         .selectable_label(self.lang == Some(Lang::Tr), "TR")
+                        .on_hover_text("Türkçe")
                         .clicked()
                     {
                         self.set_lang(Lang::Tr);
@@ -1189,6 +1331,7 @@ impl eframe::App for PlayerApp {
                 });
             });
         });
+        }
 
         egui::Panel::bottom("controls").show_inside(ui, |ui| {
             let mut hit_frame = None;
@@ -1204,8 +1347,17 @@ impl eframe::App for PlayerApp {
                 if self.playing {
                     keep_tl_in_view(&mut self.tl_zoom, &mut self.tl_scroll, shown, total);
                 }
+                if self.wave_on {
                 if let Some(audio) = &self.audio {
-                    drag_bar_height(ui, &mut self.wave_h, 24.0, 220.0);
+                    if !self.focus {
+                    drag_bar_height(
+                        ui,
+                        &mut self.wave_h,
+                        24.0,
+                        220.0,
+                        lang.tr("Dalga yüksekliği", "Waveform height"),
+                    );
+                    }
                     let (rect, f) = paint_waveform(
                         ui,
                         &audio.peaks,
@@ -1221,7 +1373,16 @@ impl eframe::App for PlayerApp {
                         hit_rect = Some(rect);
                     }
                 }
-                drag_bar_height(ui, &mut self.bar_h, 22.0, 100.0);
+                }
+                if !self.focus {
+                drag_bar_height(
+                    ui,
+                    &mut self.bar_h,
+                    22.0,
+                    100.0,
+                    lang.tr("Cetvel yüksekliği", "Ruler height"),
+                );
+                }
                 let (rect, f) = paint_framebar(
                     ui,
                     shown,
@@ -1236,23 +1397,6 @@ impl eframe::App for PlayerApp {
                     hit_frame = Some(f);
                     hit_rect = Some(rect);
                 }
-                ui.horizontal(|ui| {
-                    ui.label("−");
-                    let zmax = total.saturating_sub(1).max(1) as f32;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut self.tl_zoom, 1.0..=zmax)
-                                .logarithmic(true)
-                                .show_value(false)
-                                .trailing_fill(true),
-                        )
-                        .on_hover_text(lang.tr("Zaman çizelgesi zoom", "Timeline zoom"))
-                        .changed()
-                    {
-                        center_tl(&mut self.tl_scroll, self.tl_zoom, shown, total);
-                    }
-                    ui.label("+");
-                });
                 ui.add_space(4.0);
             }
             if let (Some(f), Some(rect)) = (hit_frame, hit_rect) {
@@ -1304,105 +1448,168 @@ impl eframe::App for PlayerApp {
                     }
                 }
             }
-            ui.horizontal(|ui| {
+            {
                 let enabled = self.decoder.is_some();
-                ui.add_enabled_ui(enabled, |ui| {
-                    if ui.button(lang.tr("−10 kare", "−10 frames")).clicked() {
-                        self.step_frames(&ctx, -10);
-                    }
-                    if ui.button(lang.tr("−1 kare", "−1 frame")).clicked() {
-                        self.step_frames(&ctx, -1);
-                    }
-                    let play_label = if self.playing {
-                        lang.tr("Duraklat", "Pause")
-                    } else {
-                        lang.tr("Oynat", "Play")
-                    };
-                    if ui.button(play_label).clicked() {
-                        self.toggle_play();
-                    }
-                    if ui.button(lang.tr("+1 kare", "+1 frame")).clicked() {
-                        self.step_frames(&ctx, 1);
-                    }
-                    if ui.button(lang.tr("+10 kare", "+10 frames")).clicked() {
-                        self.step_frames(&ctx, 10);
-                    }
-                    ui.separator();
-                    ui.label(lang.tr("Ses", "Vol"));
-                    let mut vol_pct = (self.volume * 100.0).round();
-                    ui.scope(|ui| {
-                        ui.visuals_mut().override_text_color = Some(if vol_pct > 110.0 {
-                            Color32::from_rgb(220, 70, 60)
-                        } else if vol_pct >= 90.0 {
-                            Color32::from_rgb(210, 170, 30)
-                        } else {
-                            ui.visuals().text_color()
-                        });
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut vol_pct)
-                                    .range(0.0..=125.0)
-                                    .suffix("%")
-                                    .speed(1.0)
-                                    .max_decimals(0),
-                            )
-                            .changed()
-                        {
-                            self.volume = (vol_pct / 100.0).clamp(0.0, 1.25);
-                            self.apply_volume();
-                        }
-                    });
-                    ui.separator();
-                    let at = self
-                        .playhead
-                        .or_else(|| self.decoder.as_ref().map(|d| d.current));
-                    if ui
-                        .button("I")
-                        .on_hover_text(lang.tr("Döngü girişi", "Loop in"))
-                        .clicked()
-                    {
-                        if let Some(f) = at {
-                            self.set_loop_in(f);
-                        }
-                    }
-                    if ui
-                        .button("O")
-                        .on_hover_text(lang.tr("Döngü çıkışı", "Loop out"))
-                        .clicked()
-                    {
-                        if let Some(f) = at {
-                            self.set_loop_out(f);
-                        }
-                    }
-                    ui.checkbox(&mut self.loop_on, "Loop");
-                    if self.loop_range().is_some()
-                        && ui
-                            .button("×")
-                            .on_hover_text(lang.tr("Aralığı sil", "Clear range"))
-                            .clicked()
-                    {
-                        self.clear_loop();
-                    }
-                    if let Some((a, b)) = self.loop_range() {
-                        ui.weak(format!("{a}–{b}"));
-                        ui.add_enabled_ui(self.export.is_none(), |ui| {
+                let w = ui.available_width();
+                let h = 34.0;
+                let (row, _) = ui.allocate_exact_size(egui::vec2(w, h), Sense::hover());
+                let mid = Rect::from_center_size(row.center(), egui::vec2(248.0, h));
+                let left = Rect::from_min_max(row.left_top(), Pos2::new(mid.left() - 6.0, row.bottom()));
+                let right = Rect::from_min_max(Pos2::new(mid.right() + 6.0, row.top()), row.right_bottom());
+                if !self.focus {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            let at = self
+                                .playhead
+                                .or_else(|| self.decoder.as_ref().map(|d| d.current));
+                            let i_lab = self
+                                .loop_range()
+                                .map(|(a, _)| format!("I {a}"))
+                                .unwrap_or_else(|| "I".into());
+                            let o_lab = self
+                                .loop_range()
+                                .map(|(_, b)| format!("O {b}"))
+                                .unwrap_or_else(|| "O".into());
                             if ui
-                                .button(lang.tr("Kırp ve kaydet", "Trim & save"))
+                                .button(i_lab)
+                                .on_hover_text(lang.tr("Döngü girişi (I)", "Loop in (I)"))
+                                .clicked()
+                            {
+                                if let Some(f) = at {
+                                    self.set_loop_in(f);
+                                }
+                            }
+                            if ui
+                                .button(o_lab)
+                                .on_hover_text(lang.tr("Döngü çıkışı (O)", "Loop out (O)"))
+                                .clicked()
+                            {
+                                if let Some(f) = at {
+                                    self.set_loop_out(f);
+                                }
+                            }
+                            ui.checkbox(&mut self.loop_on, "Loop").on_hover_text(
+                                lang.tr("Aralıkta döngü (I/O)", "Loop the I/O range"),
+                            );
+                            if self.loop_range().is_some() {
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text(lang.tr("Aralığı sil", "Clear range"))
+                                    .clicked()
+                                {
+                                    self.clear_loop();
+                                }
+                                ui.add_enabled_ui(self.export.is_none(), |ui| {
+                                    if ui
+                                        .button(lang.tr("Kırp ve farklı kaydet", "Trim and Save As"))
+                                        .on_hover_text(lang.tr(
+                                            "Döngüyü aynı formatta yeni dosyaya yaz",
+                                            "Write the loop to a new file in the same format",
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.export_loop();
+                                    }
+                                });
+                            } else {
+                                ui.weak(lang.tr("Shift+sürükle", "Shift+drag"))
+                                    .on_hover_text(lang.tr(
+                                        "Cetvelde Shift+sürükle ile I/O seç",
+                                        "Shift+drag on the ruler to set I/O",
+                                    ));
+                            }
+                        });
+                    });
+                });
+                }
+                ui.scope_builder(egui::UiBuilder::new().max_rect(mid), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            if ui
+                                .add_sized([36.0, 28.0], egui::Button::new("«"))
+                                .on_hover_text(lang.tr("−10 kare (Ctrl+←)", "−10 frames (Ctrl+←)"))
+                                .clicked()
+                            {
+                                self.step_frames(&ctx, -10);
+                            }
+                            if ui
+                                .add_sized([40.0, 30.0], egui::Button::new("‹"))
+                                .on_hover_text(lang.tr("−1 kare (←)", "−1 frame (←)"))
+                                .clicked()
+                            {
+                                self.step_frames(&ctx, -1);
+                            }
+                            let play = if self.playing { "❚❚" } else { "▶" };
+                            if ui
+                                .add_sized([52.0, 32.0], egui::Button::new(play))
                                 .on_hover_text(lang.tr(
-                                    "Döngüyü aynı formatta yeni dosyaya yaz",
-                                    "Write the loop to a new file in the same format",
+                                    "Oynat / duraklat (Space)",
+                                    "Play / pause (Space)",
                                 ))
                                 .clicked()
                             {
-                                self.export_loop();
+                                self.toggle_play();
+                            }
+                            if ui
+                                .add_sized([40.0, 30.0], egui::Button::new("›"))
+                                .on_hover_text(lang.tr("+1 kare (→)", "+1 frame (→)"))
+                                .clicked()
+                            {
+                                self.step_frames(&ctx, 1);
+                            }
+                            if ui
+                                .add_sized([36.0, 28.0], egui::Button::new("»"))
+                                .on_hover_text(lang.tr("+10 kare (Ctrl+→)", "+10 frames (Ctrl+→)"))
+                                .clicked()
+                            {
+                                self.step_frames(&ctx, 10);
                             }
                         });
-                    } else {
-                        ui.weak(lang.tr("Shift+sürükle · I/O", "Shift+drag · I/O"));
-                    }
+                    });
                 });
-            });
+                if !self.focus {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(168.0, 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let mut vol_pct = (self.volume * 100.0).round();
+                                    let vol_c = if vol_pct > 110.0 {
+                                        Color32::from_rgb(220, 70, 60)
+                                    } else if vol_pct >= 90.0 {
+                                        Color32::from_rgb(210, 170, 30)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    ui.weak("♪").on_hover_text(lang.tr("Ses", "Volume"));
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut vol_pct, 0.0..=125.0)
+                                                .show_value(false)
+                                                .trailing_fill(true),
+                                        )
+                                        .on_hover_text(lang.tr(
+                                            "Ses 0–125% (%100 üstü boost)",
+                                            "Volume 0–125% (boost above 100%)",
+                                        ))
+                                        .changed()
+                                    {
+                                        self.volume = (vol_pct / 100.0).clamp(0.0, 1.25);
+                                        self.apply_volume();
+                                    }
+                                    ui.colored_label(vol_c, format!("{vol_pct:.0}%"));
+                                },
+                            );
+                        });
+                    });
+                });
+                }
+            }
 
+            if !self.focus {
             if let Some((current, total, src_fps)) = self.decoder.as_ref().map(|d| {
                 (
                     self.playhead.unwrap_or(d.current),
@@ -1411,45 +1618,104 @@ impl eframe::App for PlayerApp {
                 )
             }) {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} {current} / {total}", lang.tr("Kare", "Frame")));
-                    ui.separator();
-                    ui.label(format!("{} {}", lang.tr("Zaman", "Time"), format_time(current, src_fps)));
-                    ui.separator();
-                    ui.label(format!("{} {src_fps:.3} fps", lang.tr("Kaynak", "Source")));
-                    ui.separator();
-                    ui.label(lang.tr("Oynatma FPS", "Playback FPS"));
-                    ui.add(
-                        egui::DragValue::new(&mut self.playback_fps)
-                            .range(0.01..=240.0)
-                            .speed(0.01)
-                            .min_decimals(0)
-                            .max_decimals(2),
-                    );
-                    if ui.button(lang.tr("Kaynak FPS", "Source FPS")).clicked() {
-                        self.playback_fps = src_fps;
-                    }
-                    ui.separator();
-                    if ui.button("Fit W").clicked() {
-                        self.zoom_mode = ZoomMode::FitWidth;
-                    }
-                    if ui.button("Fit H").clicked() {
-                        self.zoom_mode = ZoomMode::FitHeight;
-                    }
-                    ui.label("Zoom");
-                    let mut pct = (self.zoom * 100.0).clamp(5.0, 1600.0);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pct)
-                                .range(5.0..=1600.0)
-                                .suffix("%")
-                                .speed(1.0)
-                                .max_decimals(0),
+                    ui.monospace(format!("{current} / {total}"))
+                        .on_hover_text(lang.tr("Kare / toplam", "Frame / total"));
+                    let ms_total = (current as f64 * 1000.0 / src_fps.max(0.001)).round().max(0.0) as u64;
+                    let sec = ms_total / 1000;
+                    let ms = ms_total % 1000;
+                    ui.monospace(format!("{sec}"))
+                        .on_hover_text(lang.tr("saniye", "seconds"));
+                    ui.monospace(":");
+                    ui.monospace(format!("{ms:03}"))
+                        .on_hover_text(lang.tr("milisaniye", "milliseconds"));
+                    ui.weak(format!("{src_fps:.3} fps"))
+                        .on_hover_text(lang.tr("Kaynak kare hızı", "Source frame rate"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut pct = (self.zoom * 100.0).clamp(5.0, 1600.0);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut pct)
+                                    .range(5.0..=1600.0)
+                                    .suffix("%")
+                                    .speed(1.0)
+                                    .max_decimals(0),
+                            )
+                            .on_hover_text(lang.tr(
+                                "Önizleme zoom (videoda Ctrl+tekerlek)",
+                                "Preview zoom (Ctrl+wheel on the video)",
+                            ))
+                            .changed()
+                        {
+                            self.zoom_mode = ZoomMode::Manual;
+                            self.zoom = (pct / 100.0).clamp(ZOOM_MIN, ZOOM_MAX);
+                        }
+                        if ui
+                            .selectable_label(self.zoom_mode == ZoomMode::FitHeight, "Fit H")
+                            .on_hover_text(lang.tr(
+                                "Videoyu yüksekliğe sığdır",
+                                "Fit video to height",
+                            ))
+                            .clicked()
+                        {
+                            self.zoom_mode = ZoomMode::FitHeight;
+                        }
+                        if ui
+                            .selectable_label(self.zoom_mode == ZoomMode::FitWidth, "Fit W")
+                            .on_hover_text(lang.tr(
+                                "Videoyu genişliğe sığdır",
+                                "Fit video to width",
+                            ))
+                            .clicked()
+                        {
+                            self.zoom_mode = ZoomMode::FitWidth;
+                        }
+                        ui.weak(lang.tr("Görüntü", "View"))
+                            .on_hover_text(lang.tr("Önizleme sığdır / zoom", "Preview fit / zoom"));
+                        ui.separator();
+                        if ui
+                            .small_button(lang.tr("Reset FPS", "Reset FPS"))
+                            .on_hover_text(lang.tr(
+                                "Oynatma hızını kaynak FPS’e al",
+                                "Reset playback speed to source FPS",
+                            ))
+                            .clicked()
+                        {
+                            self.playback_fps = src_fps;
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut self.playback_fps)
+                                .range(0.01..=240.0)
+                                .speed(0.01)
+                                .min_decimals(0)
+                                .max_decimals(2)
+                                .suffix(" fps"),
                         )
-                        .changed()
-                    {
-                        self.zoom_mode = ZoomMode::Manual;
-                        self.zoom = (pct / 100.0).clamp(ZOOM_MIN, ZOOM_MAX);
-                    }
+                        .on_hover_text(lang.tr("Oynatma hızı (FPS)", "Playback speed (FPS)"));
+                        ui.separator();
+                        let zmax = total.saturating_sub(1).max(1) as f32;
+                        if ui
+                            .small_button("+")
+                            .on_hover_text(lang.tr(
+                                "Zaman çizelgesini yakınlaştır (cetvelde Ctrl+tekerlek)",
+                                "Zoom timeline in (Ctrl+wheel on the ruler)",
+                            ))
+                            .clicked()
+                        {
+                            self.tl_zoom = (self.tl_zoom * 1.25).clamp(1.0, zmax);
+                            center_tl(&mut self.tl_scroll, self.tl_zoom, current, total);
+                        }
+                        if ui
+                            .small_button("−")
+                            .on_hover_text(lang.tr(
+                                "Zaman çizelgesini uzaklaştır (cetvelde Ctrl+tekerlek)",
+                                "Zoom timeline out (Ctrl+wheel on the ruler)",
+                            ))
+                            .clicked()
+                        {
+                            self.tl_zoom = (self.tl_zoom / 1.25).clamp(1.0, zmax);
+                            center_tl(&mut self.tl_scroll, self.tl_zoom, current, total);
+                        }
+                    });
                 });
                 if self.playing {
                     self.sync_audio_speed();
@@ -1460,7 +1726,11 @@ impl eframe::App for PlayerApp {
                     "Drop a video, Open, or paste a URL.",
                 ));
             }
-            ui.add_space(6.0);
+            }
+            if self.focus && self.playing {
+                self.sync_audio_speed();
+            }
+            ui.add_space(if self.focus { 2.0 } else { 6.0 });
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -1901,11 +2171,12 @@ fn paint_loop_range(painter: &egui::Painter, rect: Rect, a: u64, b: u64, view: T
     }
 }
 
-fn drag_bar_height(ui: &mut egui::Ui, h: &mut f32, min: f32, max: f32) {
+fn drag_bar_height(ui: &mut egui::Ui, h: &mut f32, min: f32, max: f32, tip: &str) {
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 5.0),
         Sense::click_and_drag(),
     );
+    let resp = resp.on_hover_text(tip);
     let hot = resp.hovered() || resp.dragged();
     if hot {
         ui.painter().rect_filled(
