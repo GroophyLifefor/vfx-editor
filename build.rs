@@ -45,13 +45,15 @@ fn find_ffmpeg() -> PathBuf {
         panic!("ffmpeg not on PATH. Install it or set FFMPEG_EXE.");
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| panic!("where ffmpeg returned nothing"));
-    resolve(Path::new(line))
+    for line in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let p = resolve(Path::new(line));
+        if fs::metadata(&p).map(|m| m.len() >= 1_000_000).unwrap_or(false) {
+            return p;
+        }
+    }
+    panic!(
+        "ffmpeg on PATH is a shim. Set FFMPEG_EXE to the real ffmpeg.exe"
+    );
 }
 
 fn resolve(path: &Path) -> PathBuf {
