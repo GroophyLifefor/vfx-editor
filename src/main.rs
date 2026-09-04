@@ -1487,8 +1487,7 @@ impl eframe::App for PlayerApp {
                     }
                 });
                 ui.separator();
-                ui.weak(&self.status)
-                    .on_hover_text(lang.tr("Açık dosya / durum", "Open file / status"));
+                let status = self.status.clone();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .button(lang.tr("Hakkında", "About"))
@@ -1561,6 +1560,12 @@ impl eframe::App for PlayerApp {
                     {
                         self.set_lang(Lang::Tr);
                     }
+                    ui.separator();
+                    let w = ui.available_width();
+                    ui.add_sized(
+                        [w, ui.spacing().interact_size.y],
+                        egui::Label::new(egui::RichText::new(&status).weak()).truncate(),
+                    );
                 });
             });
         });
