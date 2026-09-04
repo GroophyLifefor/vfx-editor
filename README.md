@@ -1,6 +1,6 @@
 # VFX Player
 
-**Advanced Video Player for VFX Experts** — v1.2.3. Frame-accurate review, not a consumer player. No installer.
+**Advanced Video Player for VFX Experts** — v0.1.3. Frame-accurate review, not a consumer player. No installer.
 
 [![Download](https://img.shields.io/github/v/release/GroophyLifefor/vfx-editor?label=Download)](https://github.com/GroophyLifefor/vfx-editor/releases/latest)
 
