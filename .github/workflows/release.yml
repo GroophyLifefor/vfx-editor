@@ -30,6 +30,7 @@ jobs:
           if ($exists) { $ex = "true" } else { $ex = "false" }
           "exists=$ex" >> $env:GITHUB_OUTPUT
           Write-Host "tag=$tag exists=$ex"
+          exit 0
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.ver.outputs.exists != 'true'
