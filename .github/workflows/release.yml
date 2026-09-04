@@ -19,18 +19,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           if ($v -match '^(\d+)\.(\d+)\.0$') { $tag = "v$($Matches[1]).$($Matches[2])" }
           else { $tag = "v$v" }
-          $exists = $false
-          if (gh release view $tag --json id 2>$null) { $exists = $true }
+          gh release view $tag --json id *> $null
+          $exists = ($LASTEXITCODE -eq 0)
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "name=VFX Player $tag" >> $env:GITHUB_OUTPUT
-          "exists=$exists" >> $env:GITHUB_OUTPUT
-          if ($exists) { Write-Host "Release $tag already exists — skip" }
+          if ($exists) { $ex = "true" } else { $ex = "false" }
+          "exists=$ex" >> $env:GITHUB_OUTPUT
+          Write-Host "tag=$tag exists=$ex"
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.ver.outputs.exists != 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ver.outputs.exists != 'true'
+        with:
+          shared-key: release-windows
 
       - name: Install ffmpeg
         if: steps.ver.outputs.exists != 'true'
