@@ -8,6 +8,7 @@ mod play;
 mod scrub;
 mod status;
 mod timeline;
+mod tour;
 mod url;
 mod version;
 mod zoom;

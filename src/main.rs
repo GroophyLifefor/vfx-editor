@@ -3,6 +3,7 @@
 mod audio;
 mod bundle;
 mod decoder;
+mod tour;
 
 use audio::AudioTrack;
 use decoder::{export_span, Decoder};
@@ -169,14 +170,17 @@ fn load_icon() -> IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png")
 }
 
-fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, bool) {
+fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>, bool) {
     let mut open = None;
     let mut shots = None;
+    let mut video = None;
     let mut updated = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         if a == "--intro-shots" {
             shots = args.next().map(PathBuf::from);
+        } else if a == "--intro-video" {
+            video = args.next().map(PathBuf::from);
         } else if a == "--updated" {
             updated = true;
         } else {
@@ -186,14 +190,14 @@ fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, bool) {
             }
         }
     }
-    (open, shots, updated)
+    (open, shots, video, updated)
 }
 
 fn main() -> eframe::Result {
     install_crash_hook();
-    let (open, shots, updated) = parse_cli();
+    let (open, shots, video, updated) = parse_cli();
     let icon = load_icon();
-    let size = if shots.is_some() {
+    let size = if shots.is_some() || video.is_some() {
         [1280.0, 800.0]
     } else {
         [1100.0, 780.0]
@@ -208,7 +212,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "VFX Player",
         options,
-        Box::new(move |cc| Ok(Box::new(PlayerApp::new(cc, &icon, open, shots, updated)))),
+        Box::new(move |cc| Ok(Box::new(PlayerApp::new(cc, &icon, open, shots, video, updated)))),
     )
 }
 
@@ -330,6 +334,7 @@ struct PlayerApp {
     dark: bool,
     pending_open: Option<PathBuf>,
     intro: Option<IntroShots>,
+    tour: Option<TourRun>,
     tl_zoom: f32,
     tl_scroll: f32,
     wave_h: f32,
@@ -345,6 +350,19 @@ struct IntroShots {
     wait: u8,
     capture: Option<&'static str>,
     requested: bool,
+}
+
+struct TourRun {
+    dest: PathBuf,
+    beat: usize,
+    beat_at: Instant,
+    applied: bool,
+    rec: Option<std::process::Child>,
+    rec_wh: Option<(u32, u32)>,
+    last_rgba: Option<Vec<u8>>,
+    next_frame: Option<Instant>,
+    want_shot: bool,
+    sub: u8,
 }
 
 enum FetchEvent {
@@ -379,6 +397,7 @@ impl PlayerApp {
         icon: &IconData,
         pending_open: Option<PathBuf>,
         intro_dir: Option<PathBuf>,
+        tour_dest: Option<PathBuf>,
         from_update: bool,
     ) -> Self {
         let logo = cc.egui_ctx.load_texture(
@@ -397,12 +416,13 @@ impl PlayerApp {
             capture: None,
             requested: false,
         });
-        let lang = if intro.is_some() {
+        let scripted = intro.is_some() || tour_dest.is_some();
+        let lang = if scripted {
             None
         } else {
             load_lang().or(pending_open.as_ref().map(|_| Lang::En))
         };
-        let dark = intro.is_some() || load_dark();
+        let dark = scripted || load_dark();
         apply_theme(&cc.egui_ctx, dark);
         let status = match &ffmpeg {
             Ok(_) => lang
@@ -450,6 +470,18 @@ impl PlayerApp {
             dark,
             pending_open,
             intro,
+            tour: tour_dest.map(|dest| TourRun {
+                dest,
+                beat: 0,
+                beat_at: Instant::now(),
+                applied: false,
+                rec: None,
+                rec_wh: None,
+                last_rgba: None,
+                next_frame: None,
+                want_shot: false,
+                sub: 0,
+            }),
             tl_zoom: 1.0,
             tl_scroll: 0.0,
             wave_h: 56.0,
@@ -463,7 +495,7 @@ impl PlayerApp {
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
-        if app.intro.is_none() {
+        if app.intro.is_none() && app.tour.is_none() {
             let marked = take_just_updated();
             if from_update || marked {
                 app.update_modal = Some(UpdateModal::Done);
@@ -643,6 +675,248 @@ impl PlayerApp {
                 }
             }
             _ => std::process::exit(0),
+        }
+    }
+
+    fn tick_tour(&mut self, ctx: &egui::Context) {
+        if self.tour.is_none() {
+            return;
+        }
+        ctx.request_repaint();
+        let (i, t) = {
+            let tour = self.tour.as_ref().unwrap();
+            let Some(beat) = tour::BEATS.get(tour.beat) else {
+                if let Some(mut tour) = self.tour.take() {
+                    if let Some(c) = tour.rec.take() {
+                        tour::stop_pipe(c);
+                    }
+                }
+                std::process::exit(0);
+            };
+            (tour.beat, tour.beat_at.elapsed().as_secs_f32() / beat.secs)
+        };
+        let first = !self.tour.as_ref().unwrap().applied;
+        self.apply_tour_beat(ctx, tour::BEATS[i].id, t.clamp(0.0, 1.0), first);
+        if let Some(tour) = &mut self.tour {
+            tour.applied = true;
+        }
+        if t >= 1.0 {
+            if let Some(tour) = &mut self.tour {
+                tour.beat += 1;
+                tour.beat_at = Instant::now();
+                tour.applied = false;
+                tour.sub = 0;
+            }
+        }
+        let shot = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = shot {
+            let w = image.width();
+            let h = image.height();
+            let ew = w & !1;
+            let eh = h & !1;
+            let mut rgba = Vec::with_capacity(ew * eh * 4);
+            for y in 0..eh {
+                for x in 0..ew {
+                    rgba.extend_from_slice(&image.pixels[y * w + x].to_array());
+                }
+            }
+            if let Some(tour) = &mut self.tour {
+                tour.want_shot = false;
+                if tour.rec.is_none() {
+                    if let Ok(ff) = &self.ffmpeg {
+                        match tour::start_pipe(ff, &tour.dest, ew as u32, eh as u32) {
+                            Ok(c) => {
+                                tour.rec = Some(c);
+                                tour.rec_wh = Some((ew as u32, eh as u32));
+                                tour.next_frame = Some(Instant::now());
+                            }
+                            Err(e) => {
+                                let _ = std::fs::write(tour.dest.with_extension("log"), e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                if tour.rec_wh == Some((ew as u32, eh as u32)) {
+                    tour.last_rgba = Some(rgba);
+                }
+            }
+        }
+        if let Some(tour) = &mut self.tour {
+            let due = tour.next_frame;
+            let ready = due.is_some_and(|d| d <= Instant::now());
+            if tour.rec.is_some() && ready {
+                if let Some(rgba) = tour.last_rgba.clone() {
+                    if let Some(rec) = &mut tour.rec {
+                        if let Err(e) = tour::write_frame(rec, &rgba) {
+                            let _ = std::fs::write(tour.dest.with_extension("log"), e);
+                            std::process::exit(1);
+                        }
+                    }
+                    tour.next_frame =
+                        Some(Instant::now() + std::time::Duration::from_secs_f32(1.0 / tour::FPS));
+                }
+            }
+        }
+        if let Some(tour) = &self.tour {
+            if !tour.want_shot {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                if let Some(tour) = &mut self.tour {
+                    tour.want_shot = true;
+                }
+            }
+        }
+    }
+
+    fn tour_caption(&self, ctx: &egui::Context, view: Rect) {
+        let Some(tour) = &self.tour else {
+            return;
+        };
+        let Some(b) = tour::BEATS.get(tour.beat) else {
+            return;
+        };
+        let text = self.lang.unwrap_or(Lang::En).tr(b.tr, b.en);
+        egui::Area::new(egui::Id::new("tour_cap"))
+            .pivot(Align2::CENTER_BOTTOM)
+            .fixed_pos(Pos2::new(view.center().x, view.bottom() - 12.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(12, 12, 14, 220))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(520.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .size(20.0)
+                                    .color(Color32::from_gray(240)),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend)
+                            .halign(egui::Align::Center),
+                        );
+                    });
+            });
+    }
+
+    fn apply_tour_beat(&mut self, ctx: &egui::Context, id: &str, t: f32, first: bool) {
+        let n = self.decoder.as_ref().map(|d| d.info.frame_count.max(1));
+        match id {
+            "language" => {}
+            "empty" if first => {
+                self.set_lang(Lang::En);
+            }
+            "open" if first => {
+                if let Some(p) = self.pending_open.take() {
+                    self.open_path(p, ctx);
+                }
+            }
+            "play" if first => {
+                if !self.playing {
+                    self.toggle_play(ctx);
+                }
+            }
+            "step" => {
+                let stage = if t < 0.12 {
+                    0
+                } else if t < 0.38 {
+                    1
+                } else if t < 0.62 {
+                    2
+                } else {
+                    3
+                };
+                let sub = self.tour.as_ref().map(|t| t.sub).unwrap_or(0);
+                if first && self.playing {
+                    self.toggle_play(ctx);
+                }
+                if sub < 1 && stage >= 1 {
+                    self.step_frames(ctx, 1);
+                    if let Some(tour) = &mut self.tour {
+                        tour.sub = 1;
+                    }
+                }
+                if sub < 2 && stage >= 2 {
+                    self.step_frames(ctx, 1);
+                    if let Some(tour) = &mut self.tour {
+                        tour.sub = 2;
+                    }
+                }
+                if sub < 3 && stage >= 3 {
+                    self.step_frames(ctx, 10);
+                    if let Some(tour) = &mut self.tour {
+                        tour.sub = 3;
+                    }
+                }
+            }
+            "loop" if first => {
+                if let Some(n) = n {
+                    let a = n / 6;
+                    let b = n * 2 / 3;
+                    self.set_loop_span(a, b);
+                    self.seek_to(ctx, a);
+                    self.tl_zoom = 3.5;
+                    center_tl(&mut self.tl_scroll, self.tl_zoom, (a + b) / 2, n);
+                }
+                if !self.playing {
+                    self.toggle_play(ctx);
+                }
+            }
+            "wave" if first => {
+                self.wave_on = true;
+                self.volume = 1.25;
+                self.wave_h = 72.0;
+                self.focus = false;
+                self.about_open = false;
+                self.log_open = false;
+            }
+            "zoom" => {
+                self.zoom_mode = ZoomMode::Manual;
+                self.zoom = 1.0 + 1.4 * t;
+                if let Some(n) = n {
+                    let f = self.playhead.or(self.decoder.as_ref().map(|d| d.current)).unwrap_or(n / 5);
+                    self.tl_zoom = 3.5 + 3.0 * t;
+                    center_tl(&mut self.tl_scroll, self.tl_zoom, f, n);
+                }
+            }
+            "focus" if first => {
+                self.focus = true;
+                self.about_open = false;
+                self.log_open = false;
+                if !self.playing {
+                    self.toggle_play(ctx);
+                }
+            }
+            "about" if first => {
+                self.focus = false;
+                self.log_open = false;
+                self.about_open = true;
+            }
+            "log" if first => {
+                self.about_open = false;
+                self.log_open = true;
+            }
+            "fit" if first => {
+                self.log_open = false;
+                self.about_open = false;
+                self.focus = false;
+                self.zoom_mode = ZoomMode::FitWidth;
+                self.zoom = 1.0;
+                self.pan = Vec2::ZERO;
+            }
+            "end" if first => {
+                self.zoom_mode = ZoomMode::Contain;
+                if !self.playing {
+                    self.toggle_play(ctx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1513,13 +1787,13 @@ impl eframe::App for PlayerApp {
         self.show_logs(ctx);
         self.show_update_modal(ctx);
         self.show_format_modal(ctx);
-        if self.intro.is_none() {
+        if self.intro.is_none() && self.tour.is_none() {
             if let Some(p) = self.pending_open.take() {
                 self.open_path(p, ctx);
             }
         }
         self.tick_intro(ctx);
-        if self.lang.is_some() {
+        if self.lang.is_some() && self.tour.is_none() {
             let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
             if let Some(path) = dropped {
                 self.open_path(path, ctx);
@@ -1590,6 +1864,10 @@ impl eframe::App for PlayerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.tour.is_some() {
+            self.tick_tour(&ctx);
+            ctx.request_repaint();
+        }
         if self.lang.is_none() {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 ui.centered_and_justified(|ui| {
@@ -1616,6 +1894,7 @@ impl eframe::App for PlayerApp {
                     });
                 });
             });
+            self.tour_caption(&ctx, ctx.content_rect());
             return;
         }
         let lang = self.lang();
@@ -2149,11 +2428,11 @@ impl eframe::App for PlayerApp {
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            let avail = ui.available_size();
+            let (rect, resp) = ui.allocate_exact_size(avail, Sense::drag());
             if let Some((tex_id, w, h)) = self.texture.as_ref().zip(self.decoder.as_ref()).map(
                 |(tex, dec)| (tex.id(), dec.info.width as f32, dec.info.height as f32),
             ) {
-                let avail = ui.available_size();
-                let (rect, resp) = ui.allocate_exact_size(avail, Sense::drag());
                 if resp.hovered() {
                     let zdelta = ui.input(|i| i.zoom_delta());
                     if (zdelta - 1.0).abs() > 0.001 {
@@ -2197,10 +2476,15 @@ impl eframe::App for PlayerApp {
                     Color32::WHITE,
                 );
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(lang.tr("Video yok", "No video"));
-                });
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    lang.tr("Video yok", "No video"),
+                    FontId::proportional(14.0),
+                    ui.visuals().text_color(),
+                );
             }
+            self.tour_caption(ui.ctx(), rect);
         });
     }
 }
