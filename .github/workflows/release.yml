@@ -69,7 +69,7 @@ jobs:
           }
           $body = $Matches[1].Trim()
           $notes = "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg and yt-dlp are bundled.`n`n$body"
-          Set-Content -Path notes.md -Value $notes -Encoding utf8NoNewline
+          Set-Content -Path notes.md -Value $notes -Encoding utf8
           gh release create "${{ steps.ver.outputs.tag }}" "target/release/vfx_editor.exe" `
             --title "${{ steps.ver.outputs.name }}" `
             --notes-file notes.md `
