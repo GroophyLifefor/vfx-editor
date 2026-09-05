@@ -4,74 +4,554 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>VFX Player</title>
+    <link rel="icon" href="logo.png" type="image/png" />
     <style>
       :root {
-        color-scheme: dark;
+        --blue: #1f6fb8;
+        --blue-deep: #165a9a;
+        --orange: #ff7a18;
+        --orange-ink: #3a1a00;
+        --bg: #fff;
+        --bg2: #f3f5f8;
+        --ink: #1a1d22;
+        --muted: #5b6270;
+        --line: #d8dee8;
+        --card: #fff;
+        --nav: #2a313c;
+        --header-bg: #fff;
+        --shadow: 0 16px 40px rgba(20, 40, 70, 0.14);
+      }
+      * {
+        box-sizing: border-box;
       }
       body {
         margin: 0;
-        font: 16px/1.5 system-ui, sans-serif;
-        background: #1b1b1b;
-        color: #d2d2d2;
+        background: var(--bg);
+        color: var(--ink);
+        font: 16px/1.5 "Segoe UI", system-ui, sans-serif;
       }
-      main {
+      #en,
+      #tr,
+      #dark {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+      }
+      body:has(#en:checked) .tr {
+        display: none;
+      }
+      body:has(#tr:checked) .en {
+        display: none;
+      }
+      body:has(#en:checked) label[for="en"],
+      body:has(#tr:checked) label[for="tr"] {
+        color: var(--blue);
+      }
+      body:has(#dark:checked) {
+        --bg: #121316;
+        --bg2: #1a1c20;
+        --ink: #f2f3f5;
+        --muted: #a8adb8;
+        --line: #2c3038;
+        --card: #1e2126;
+        --nav: #e8eaee;
+        --header-bg: #0e0f12;
+        --shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+        color-scheme: dark;
+      }
+      body:has(#dark:checked) .moon {
+        display: none;
+      }
+      body:not(:has(#dark:checked)) .sun {
+        display: none;
+      }
+      .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      header {
+        background: var(--header-bg);
+        border-bottom: 1px solid var(--line);
+      }
+      header .bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        min-height: 68px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 700;
+        color: var(--ink);
+        text-decoration: none;
+        font-size: 1.05rem;
+      }
+      .brand img {
+        width: 36px;
+        height: 36px;
+        display: block;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      nav .lang {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 6px 8px;
+      }
+      .icon-btn {
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        color: var(--nav);
+        border-radius: 8px;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .icon-btn:hover {
+        background: var(--bg2);
+      }
+      .icon-btn svg {
+        width: 18px;
+        height: 18px;
+        fill: currentColor;
+      }
+      .btn {
+        display: inline-block;
+        text-decoration: none;
+        border: 0;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        padding: 14px 28px;
+        border-radius: 999px;
+        background: var(--orange);
+        color: var(--orange-ink);
+      }
+      .btn.nav {
+        padding: 8px 16px;
+        font-size: 13px;
+      }
+      .hero {
+        background:
+          radial-gradient(ellipse at 70% 0%, rgba(255, 255, 255, 0.16), transparent 46%),
+          linear-gradient(180deg, #2a86d2 0%, var(--blue-deep) 100%);
+        color: #fff;
+        text-align: center;
+        padding: 64px 0 0;
+      }
+      .hero h1 {
+        font-size: clamp(2.2rem, 5.5vw, 3.4rem);
+        line-height: 1.12;
+        margin: 0 auto 12px;
+        font-weight: 800;
+      }
+      .hero .sub {
+        margin: 0 auto 28px;
+        font-size: 1.15rem;
+        color: rgba(255, 255, 255, 0.9);
+      }
+      .hero .cta {
+        margin-bottom: 40px;
+      }
+      .shot-wrap {
         max-width: 920px;
         margin: 0 auto;
-        padding: 48px 20px 72px;
+        padding: 0 16px;
+        position: relative;
       }
-      h1 {
-        margin: 0 0 8px;
-        color: #f2f2f2;
-        font-weight: 600;
-      }
-      .sub {
-        color: #b8b8b8;
-        margin: 0 0 20px;
-      }
-      img {
+      .shot,
+      .mini,
+      .shot-wrap video {
         width: 100%;
         height: auto;
+        display: block;
         border-radius: 8px;
+        box-shadow: var(--shadow);
       }
-      .dl {
-        display: inline-block;
-        margin: 0 12px 20px 0;
-        padding: 10px 16px;
-        background: #208c78;
+      .shot,
+      .shot-wrap video {
+        border-radius: 8px 8px 0 0;
+      }
+      .demo-thumb {
+        all: unset;
+        display: block;
+        width: 100%;
+        cursor: pointer;
+        position: relative;
+      }
+      .play {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 76px;
+        height: 76px;
+        margin: -38px 0 0 -38px;
+        border-radius: 50%;
+        background: var(--orange);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+      }
+      .play::after {
+        content: "";
+        position: absolute;
+        left: 29px;
+        top: 24px;
+        border-style: solid;
+        border-width: 14px 0 14px 22px;
+        border-color: transparent transparent transparent var(--orange-ink);
+      }
+      .shot-wrap.playing .demo-thumb {
+        display: none;
+      }
+      .shot-wrap video {
+        display: none;
+        background: #000;
+      }
+      .shot-wrap.playing video {
+        display: block;
+      }
+      .demo-note {
+        margin: 0;
+        padding: 12px 16px 28px;
+        font-size: 13px;
+        color: rgba(255, 255, 255, 0.72);
+      }
+      .band {
+        background: var(--bg);
+        padding: 80px 0;
+      }
+      .band.alt {
+        background: var(--bg2);
+      }
+      .band.blue {
+        background: var(--blue);
         color: #fff;
-        text-decoration: none;
-        border-radius: 6px;
       }
-      a.gh {
-        color: #8ec8ff;
+      .row {
+        display: grid;
+        gap: 48px;
+        align-items: center;
+      }
+      @media (min-width: 800px) {
+        .row {
+          grid-template-columns: 1.15fr 0.85fr;
+        }
+        .row.flip {
+          grid-template-columns: 0.85fr 1.15fr;
+        }
+        .row.flip .copy {
+          order: -1;
+        }
+      }
+      .copy h2 {
+        margin: 0 0 12px;
+        font-size: 2rem;
+        line-height: 1.2;
+      }
+      .copy p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+      .donate-inner {
+        display: grid;
+        gap: 28px;
+        align-items: center;
+        text-align: center;
+      }
+      @media (min-width: 800px) {
+        .donate-inner {
+          grid-template-columns: 1fr auto;
+          text-align: left;
+        }
+      }
+      .donate-inner h2 {
+        margin: 0 0 10px;
+        font-size: 2rem;
+      }
+      .donate-inner p {
+        margin: 0;
+        color: rgba(255, 255, 255, 0.9);
+        max-width: 36rem;
+      }
+      .formats {
+        text-align: center;
+        color: var(--muted);
+        font-size: 14px;
+        letter-spacing: 0.02em;
+      }
+      footer {
+        background: var(--header-bg);
+        border-top: 1px solid var(--line);
+        padding: 36px 0 28px;
+      }
+      .foot {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 20px;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .foot-links {
+        display: flex;
+        gap: 18px;
+        align-items: center;
+      }
+      .foot-links button,
+      .foot-links a {
+        background: none;
+        border: 0;
+        padding: 0;
+        font: inherit;
+        font-weight: 600;
+        color: var(--ink);
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .copy-line {
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 13px;
       }
     </style>
   </head>
   <body>
-    <main>
-      <h1>VFX Player</h1>
-      <p class="sub">
-        Advanced Video Player for VFX Experts. Frame-accurate review, not a
-        consumer player. No installer.
+    <input type="radio" name="lang" id="en" checked />
+    <input type="radio" name="lang" id="tr" />
+    <input type="checkbox" id="dark" />
+    <header>
+      <div class="wrap bar">
+        <a class="brand" href="#">
+          <img src="logo.png" alt="" />
+          VFX Player
+        </a>
+        <nav>
+          <button class="btn nav js-donate" type="button">
+            <span class="en">Donate</span><span class="tr">Destekle</span>
+          </button>
+          <a
+            class="icon-btn"
+            href="https://github.com/GroophyLifefor/vfx-editor"
+            aria-label="GitHub"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M8 0a8 8 0 0 0-2.53 15.6c.4.07.55-.17.55-.38v-1.35c-2.22.48-2.69-1.07-2.69-1.07-.36-.92-.89-1.16-.89-1.16-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.22 1.88.87 2.34.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0z"
+              />
+            </svg>
+          </a>
+          <label class="lang" for="tr">TR</label>
+          <label class="lang" for="en">EN</label>
+          <label class="icon-btn" for="dark">
+            <svg class="moon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M21 14.5A8.5 8.5 0 0 1 9.5 3 7 7 0 1 0 21 14.5z"
+              />
+            </svg>
+            <svg class="sun" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12zm0-16v2m0 16v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2m16 0h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+              />
+            </svg>
+          </label>
+        </nav>
+      </div>
+    </header>
+    <section class="hero">
+      <div class="wrap">
+        <h1 class="en">See every frame.</h1>
+        <h1 class="tr">Her kareyi gör.</h1>
+        <p class="sub en">A player for VFX review.</p>
+        <p class="sub tr">VFX review için player.</p>
+        <p class="cta">
+          <a
+            class="btn"
+            href="https://github.com/GroophyLifefor/vfx-editor/releases/latest/download/vfx_editor.exe"
+            ><span class="en">Download For FREE</span
+            ><span class="tr">ÜCRETSİZ İNDİR</span></a
+          >
+        </p>
+      </div>
+      <div class="shot-wrap" id="demo-player">
+        <button class="demo-thumb" type="button" aria-label="Play demo">
+          <img class="shot" src="screenshot.png" alt="VFX Player" />
+          <span class="play"></span>
+        </button>
+        <video src="demo.mp4" controls playsinline></video>
+        <p class="demo-note en">
+          Not frozen. Frame stepping looks still on purpose.
+        </p>
+        <p class="demo-note tr">
+          Donmuyor. Kare işlemleri gösterilirken öyle duruyor.
+        </p>
+      </div>
+    </section>
+
+    <section class="band">
+      <div class="wrap row">
+        <img class="mini" src="feat-step.png" alt="" />
+        <div class="copy">
+          <h2 class="en">Step through the shot.</h2>
+          <h2 class="tr">Shot’ı kare kare gez.</h2>
+          <p class="en">
+            One frame or ten. You always know where you are. Time, frame, and
+            playback speed on one bar.
+          </p>
+          <p class="tr">
+            Bir kare veya on. Zaman, kare ve hız aynı barda. Playhead’i tahmin
+            etmezsin.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band alt">
+      <div class="wrap row flip">
+        <img class="mini" src="feat-loop.png" alt="" />
+        <div class="copy">
+          <h2 class="en">Mark it. Loop it. Send it.</h2>
+          <h2 class="tr">İşaretle. Döngüye al. Gönder.</h2>
+          <p class="en">
+            Set in and out, loop the range, trim and save in the same format.
+            The note leaves with the clip.
+          </p>
+          <p class="tr">
+            Giriş ve çıkışı işaretle, aralığı döngüye al, aynı formatta kırp.
+            Not, klibin yanında gider.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band">
+      <div class="wrap row">
+        <img class="mini" src="feat-wave.png" alt="" />
+        <div class="copy">
+          <h2 class="en">Hear if it lines up.</h2>
+          <h2 class="tr">Oturuyor mu, duy.</h2>
+          <p class="en">
+            Waveform on the timeline. Turn the volume past 100% when the mix is
+            too quiet to judge.
+          </p>
+          <p class="tr">
+            Timeline’da waveform. Mix kısıkssa sesi %100’ün üzerine çek, karar
+            ver.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band alt">
+      <div class="wrap row flip">
+        <img class="mini" src="feat-zoom.png" alt="" />
+        <div class="copy">
+          <h2 class="en">Get closer to the pixel.</h2>
+          <h2 class="tr">Piksele yaklaş.</h2>
+          <p class="en">
+            Zoom the preview, fit width or height, drag the waveform and ruler
+            when the screen is tight.
+          </p>
+          <p class="tr">
+            Önizlemeyi büyüt, genişliğe veya yüksekliğe sığdır. Ekran darınca
+            dalga ve cetveli sürükle.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band">
+      <p class="wrap formats">
+        mp4 · mov · m4v · mkv · webm · avi · wmv · mpg · mpeg · m2ts · ts · vob
+        · flv · 3gp · ogv · mxf
       </p>
-      <p>
-        <a
-          class="dl"
-          href="https://github.com/GroophyLifefor/vfx-editor/releases/latest/download/vfx_editor.exe"
-          >Download vfx_editor.exe</a
-        >
-        <a class="gh" href="https://github.com/GroophyLifefor/vfx-editor"
-          >GitHub</a
-        >
-      </p>
-      <p><img src="screenshot.png" alt="VFX Player" /></p>
-      <p>
-        Windows x64. FFmpeg and yt-dlp bundled. First launch: Türkçe / English.
-      </p>
-      <p>
-        Made by
-        <a class="gh" href="https://github.com/GroophyLifefor">Murat Kirazkaya</a>
-      </p>
-    </main>
+    </section>
+
+    <section class="band blue" id="donate">
+      <div class="wrap donate-inner">
+        <div>
+          <h2 class="en">Buy a coffee.</h2>
+          <h2 class="tr">Bir kahve ısmarla.</h2>
+          <p class="en">
+            VFX Player is free. If it saves you time on review, a coffee helps
+            keep it going.
+          </p>
+          <p class="tr">
+            VFX Player ücretsiz. Review’da zaman kazandırdıysa bir kahve işi
+            yürüttürür.
+          </p>
+        </div>
+        <button class="btn js-donate" type="button">
+          <span class="en">Donate</span><span class="tr">Destekle</span>
+        </button>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <div class="foot">
+          <a class="brand" href="#">
+            <img src="logo.png" alt="" />
+            VFX Player
+          </a>
+          <div class="foot-links">
+            <a
+              href="https://github.com/GroophyLifefor/vfx-editor/releases/latest/download/vfx_editor.exe"
+              ><span class="en">Download</span><span class="tr">İndir</span></a
+            >
+            <button class="js-donate" type="button">
+              <span class="en">Donate</span><span class="tr">Destekle</span>
+            </button>
+            <a
+              class="icon-btn"
+              href="https://github.com/GroophyLifefor/vfx-editor"
+              aria-label="GitHub"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 0a8 8 0 0 0-2.53 15.6c.4.07.55-.17.55-.38v-1.35c-2.22.48-2.69-1.07-2.69-1.07-.36-.92-.89-1.16-.89-1.16-.73-.50.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.22 1.88.87 2.34.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0z"
+                />
+              </svg>
+            </a>
+          </div>
+        </div>
+        <p class="copy-line">© 2026 Murat Kirazkaya</p>
+      </div>
+    </footer>
+    <script>
+      const DONATE = "https://be.ordubenim.com/auth/polar/donate";
+      async function goDonate() {
+        const r = await fetch(DONATE);
+        const data = await r.json();
+        location.href = data.checkoutUrl;
+      }
+      document.querySelectorAll(".js-donate").forEach((el) => {
+        el.onclick = () => goDonate().catch(() => {});
+      });
+      const player = document.getElementById("demo-player");
+      const demo = player.querySelector("video");
+      player.querySelector(".demo-thumb").onclick = () => {
+        player.classList.add("playing");
+        demo.play();
+      };
+      demo.onended = () => {
+        player.classList.remove("playing");
+        demo.currentTime = 0;
+      };
+    </script>
   </body>
 </html>
