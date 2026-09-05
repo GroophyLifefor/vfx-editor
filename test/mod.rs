@@ -11,4 +11,5 @@ mod timeline;
 mod tour;
 mod url;
 mod version;
+mod volume;
 mod zoom;

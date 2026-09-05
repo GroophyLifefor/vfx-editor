@@ -146,6 +146,31 @@ fn save_dark(dark: bool) {
     let _ = std::fs::write(theme_path(), if dark { "dark" } else { "light" });
 }
 
+fn volume_path() -> PathBuf {
+    bundle::data_dir().join("volume")
+}
+
+fn parse_volume(s: &str) -> Option<f32> {
+    let p: f32 = s.trim().parse().ok()?;
+    if !(0.0..=125.0).contains(&p) {
+        return None;
+    }
+    Some((p / 100.0).clamp(0.0, 1.25))
+}
+
+fn load_volume() -> f32 {
+    std::fs::read_to_string(volume_path())
+        .ok()
+        .and_then(|s| parse_volume(&s))
+        .unwrap_or(1.0)
+}
+
+fn save_volume(v: f32) {
+    let p = ((v * 100.0).round() as i32).clamp(0, 125);
+    let _ = std::fs::create_dir_all(bundle::data_dir());
+    let _ = std::fs::write(volume_path(), p.to_string());
+}
+
 fn dark_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
     v.weak_text_alpha = 0.9;
@@ -466,7 +491,7 @@ impl PlayerApp {
             log_open: false,
             started: Instant::now(),
             logs: Vec::new(),
-            volume: 1.0,
+            volume: load_volume(),
             dark,
             pending_open,
             intro,
@@ -2293,6 +2318,7 @@ impl eframe::App for PlayerApp {
                                     {
                                         self.volume = (vol_pct / 100.0).clamp(0.0, 1.25);
                                         self.apply_volume();
+                                        save_volume(self.volume);
                                     }
                                     ui.colored_label(vol_c, format!("{vol_pct:.0}%"));
                                 },

@@ -2,6 +2,11 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.7
+
+- `--intro-video` records a ~30s scripted tour with captions on the preview
+- Keep volume when you open another video or restart the app
+
 ## 0.1.6
 
 - Restart play from the start when decode hits EOF before the probed last frame
