@@ -1096,11 +1096,17 @@ impl PlayerApp {
         );
     }
 
-    fn toggle_play(&mut self) {
+    fn toggle_play(&mut self, ctx: &egui::Context) {
         self.playing = !self.playing;
         self.last_tick = None;
         self.accum = 0.0;
         if self.playing {
+            if let Some(dec) = &self.decoder {
+                let dest = play_resume_frame(dec.current, dec.info.frame_count.saturating_sub(1));
+                if dest != dec.current {
+                    self.seek_to(ctx, dest);
+                }
+            }
             self.start_audio();
         } else {
             self.stop_audio();
@@ -1323,7 +1329,7 @@ impl PlayerApp {
             }
         });
         if play {
-            self.toggle_play();
+            self.toggle_play(ctx);
         }
         if step != 0 {
             self.step_frames(ctx, step);
@@ -1787,7 +1793,7 @@ impl eframe::App for PlayerApp {
                                 ))
                                 .clicked()
                             {
-                                self.toggle_play();
+                                self.toggle_play(&ctx);
                             }
                             if ui
                                 .add_sized([40.0, 30.0], egui::Button::new("›"))
@@ -2953,6 +2959,14 @@ fn paint_waveform(
     (rect, pointer_frame(ui, &resp, rect, view, total))
 }
 
+fn play_resume_frame(current: u64, last: u64) -> u64 {
+    if last == 0 || current >= last {
+        0
+    } else {
+        current
+    }
+}
+
 fn loop_step(current: u64, delta: i64, a: u64, b: u64) -> u64 {
     if delta == 0 || current < a || current > b {
         return current.saturating_add_signed(delta);
@@ -3094,85 +3108,5 @@ fn paint_playhead(painter: &egui::Painter, rect: Rect, frame: u64, view: TimeVie
 }
 
 #[cfg(test)]
-mod url_tests {
-    use super::url_ext;
-
-    #[test]
-    fn picks_known_or_mp4() {
-        assert_eq!(url_ext("https://x.com/a.mkv?token=1"), "mkv");
-        assert_eq!(url_ext("https://x.com/a.MOV"), "mov");
-        assert_eq!(url_ext("https://x.com/noext"), "mp4");
-    }
-}
-
-#[cfg(test)]
-mod loop_step_tests {
-    use super::loop_step;
-
-    #[test]
-    fn plus_ten_hits_out_then_wraps_from_in() {
-        let mut f = 15u64;
-        let seq: Vec<u64> = (0..4)
-            .map(|_| {
-                f = loop_step(f, 10, 15, 33);
-                f
-            })
-            .collect();
-        assert_eq!(seq, [25, 33, 25, 33]);
-    }
-
-    #[test]
-    fn plus_ten_tiny_range_clamps_at_out() {
-        let mut f = 15u64;
-        let seq: Vec<u64> = (0..4)
-            .map(|_| {
-                f = loop_step(f, 10, 15, 23);
-                f
-            })
-            .collect();
-        assert_eq!(seq, [23, 23, 23, 23]);
-    }
-}
-
-#[cfg(test)]
-mod scrub_tests {
-    use super::{x_to_frame, TimeView};
-
-    #[test]
-    fn maps_edges_and_mid() {
-        let v = TimeView {
-            start: 0.0,
-            span: 10.0,
-        };
-        assert_eq!(x_to_frame(0.0, 0.0, 100.0, v, 11), 0);
-        assert_eq!(x_to_frame(100.0, 0.0, 100.0, v, 11), 10);
-        assert_eq!(x_to_frame(50.0, 0.0, 100.0, v, 11), 5);
-    }
-}
-
-#[cfg(test)]
-mod zoom_tests {
-    use super::{remap_pan, view_scale, ZoomMode, ZOOM_MAX};
-    use eframe::egui::Vec2;
-
-    #[test]
-    fn fit_and_clamp() {
-        assert!((view_scale(200.0, 100.0, 100.0, 100.0, ZoomMode::FitWidth, 1.0) - 2.0).abs() < 1e-5);
-        assert!((view_scale(200.0, 100.0, 100.0, 100.0, ZoomMode::FitHeight, 1.0) - 1.0).abs() < 1e-5);
-        assert!((view_scale(200.0, 100.0, 100.0, 100.0, ZoomMode::Contain, 1.0) - 1.0).abs() < 1e-5);
-        assert_eq!(
-            view_scale(8000.0, 8000.0, 100.0, 100.0, ZoomMode::FitWidth, 1.0),
-            ZOOM_MAX
-        );
-        assert!((view_scale(200.0, 100.0, 100.0, 100.0, ZoomMode::Manual, 4.0) - 4.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn zoom_past_fit_stays_centered() {
-        let avail = Vec2::splat(200.0);
-        let old = Vec2::splat(100.0);
-        let new = Vec2::splat(400.0);
-        let pan = remap_pan(Vec2::ZERO, old, new, avail, avail * 0.5);
-        assert!((pan - Vec2::splat(100.0)).length() < 1e-3);
-    }
-}
+#[path = "../test/mod.rs"]
+mod feature_tests;
