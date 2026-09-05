@@ -1,4 +1,6 @@
+mod crash;
 mod formats;
+mod theme;
 mod hosts;
 mod i18n;
 mod loop_step;

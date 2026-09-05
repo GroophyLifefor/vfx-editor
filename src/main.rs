@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -90,6 +90,34 @@ fn lang_path() -> PathBuf {
     bundle::data_dir().join("lang")
 }
 
+fn crash_path() -> PathBuf {
+    bundle::data_dir().join("crash.log")
+}
+
+static LAST_LOG: Mutex<String> = Mutex::new(String::new());
+
+fn remember_log(dump: String) {
+    *LAST_LOG.lock().unwrap_or_else(|e| e.into_inner()) = dump;
+}
+
+fn format_crash(info: &str, dump: &str) -> String {
+    format!("{info}\n---\n{dump}")
+}
+
+fn write_crash(info: &str) {
+    let dump = LAST_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let _ = std::fs::create_dir_all(bundle::data_dir());
+    let _ = std::fs::write(crash_path(), format_crash(info, &dump));
+}
+
+fn install_crash_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        write_crash(&info.to_string());
+        prev(info);
+    }));
+}
+
 fn load_lang() -> Option<Lang> {
     std::fs::read_to_string(lang_path())
         .ok()
@@ -117,9 +145,21 @@ fn save_dark(dark: bool) {
     let _ = std::fs::write(theme_path(), if dark { "dark" } else { "light" });
 }
 
+fn dark_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.weak_text_alpha = 0.9;
+    v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(210);
+    v
+}
+
 fn apply_theme(ctx: &egui::Context, dark: bool) {
+    ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     ctx.set_visuals(if dark {
-        egui::Visuals::dark()
+        dark_visuals()
     } else {
         egui::Visuals::light()
     });
@@ -150,6 +190,7 @@ fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, bool) {
 }
 
 fn main() -> eframe::Result {
+    install_crash_hook();
     let (open, shots, updated) = parse_cli();
     let icon = load_icon();
     let size = if shots.is_some() {
@@ -282,6 +323,9 @@ struct PlayerApp {
     update_url: Option<String>,
     update_modal: Option<UpdateModal>,
     about_open: bool,
+    log_open: bool,
+    started: Instant,
+    logs: Vec<String>,
     volume: f32,
     dark: bool,
     pending_open: Option<PathBuf>,
@@ -292,6 +336,7 @@ struct PlayerApp {
     bar_h: f32,
     wave_on: bool,
     focus: bool,
+    ended: bool,
 }
 
 struct IntroShots {
@@ -398,6 +443,9 @@ impl PlayerApp {
             update_url: None,
             update_modal: None,
             about_open: false,
+            log_open: false,
+            started: Instant::now(),
+            logs: Vec::new(),
             volume: 1.0,
             dark,
             pending_open,
@@ -408,7 +456,13 @@ impl PlayerApp {
             bar_h: 28.0,
             wave_on: true,
             focus: false,
+            ended: false,
         };
+        app.log(format!(
+            "start v{APP_VERSION} {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
         if app.intro.is_none() {
             let marked = take_just_updated();
             if from_update || marked {
@@ -424,6 +478,15 @@ impl PlayerApp {
 
     fn lang(&self) -> Lang {
         self.lang.unwrap_or(Lang::En)
+    }
+
+    fn log(&mut self, msg: impl Into<String>) {
+        let t = self.started.elapsed().as_secs_f32();
+        self.logs.push(format!("[{t:8.2}] {}", msg.into()));
+        if self.logs.len() > 400 {
+            self.logs.drain(0..self.logs.len() - 300);
+        }
+        remember_log(self.log_dump());
     }
 
     fn set_lang(&mut self, lang: Lang) {
@@ -601,10 +664,12 @@ impl PlayerApp {
         self.range_drag = None;
         self.tl_zoom = 1.0;
         self.tl_scroll = 0.0;
+        self.ended = false;
         let ffmpeg = match &self.ffmpeg {
             Ok(p) => p.clone(),
             Err(e) => {
                 self.status = e.clone();
+                self.log(format!("ffmpeg: {e}"));
                 return;
             }
         };
@@ -613,6 +678,15 @@ impl PlayerApp {
                 self.playback_fps = dec.info.fps;
                 self.status = path.display().to_string();
                 self.audio = AudioTrack::load(&ffmpeg, &path);
+                self.log(format!(
+                    "open {} {}x{} fps={:.3} frames={} audio={}",
+                    path.display(),
+                    dec.info.width,
+                    dec.info.height,
+                    dec.info.fps,
+                    dec.info.frame_count,
+                    self.audio.is_some()
+                ));
                 self.decoder = Some(dec);
                 self.sync_texture(ctx);
             }
@@ -620,6 +694,7 @@ impl PlayerApp {
                 self.decoder = None;
                 self.audio = None;
                 self.texture = None;
+                self.log(format!("open fail {e}"));
                 self.status = e;
             }
         }
@@ -947,6 +1022,66 @@ impl PlayerApp {
         }
     }
 
+    fn log_dump(&self) -> String {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let dec = self.decoder.as_ref().map(|d| {
+            format!(
+                "video current={} frames={} src_fps={:.3} play_fps={:.2} ended={}",
+                d.current, d.info.frame_count, d.info.fps, self.playback_fps, self.ended
+            )
+        });
+        let mut s = format!(
+            "VFX Player v{APP_VERSION}\n\
+             os={} arch={} cores={cores} host={}\n\
+             lang={} theme={} volume={:.0}% wave={} focus={} loop={}\n\
+             {}\n---\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "-".into()),
+            self.lang().code(),
+            if self.dark { "dark" } else { "light" },
+            self.volume * 100.0,
+            self.wave_on,
+            self.focus,
+            self.loop_on,
+            dec.as_deref().unwrap_or("video none"),
+        );
+        for line in &self.logs {
+            s.push_str(line);
+            s.push('\n');
+        }
+        s
+    }
+
+    fn show_logs(&mut self, ctx: &egui::Context) {
+        if !self.log_open || self.lang.is_none() {
+            return;
+        }
+        let lang = self.lang();
+        let dump = self.log_dump();
+        let mut open = true;
+        egui::Window::new(lang.tr("Günlük", "Log"))
+            .open(&mut open)
+            .default_size([540.0, 420.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(lang.tr("Kopyala", "Copy")).clicked() {
+                        ui.ctx().copy_text(dump.clone());
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.monospace(&dump);
+                    });
+            });
+        if !open {
+            self.log_open = false;
+        }
+    }
+
     fn poll_update(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.update_rx else {
             return;
@@ -1001,94 +1136,97 @@ impl PlayerApp {
                 .with_minimize_button(false)
                 .with_maximize_button(false),
             |ui, _class| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.add(egui::Image::new((logo, egui::vec2(52.0, 52.0))));
+                apply_theme(ui.ctx(), self.dark);
+                egui::CentralPanel::default().show_inside(ui, |ui| {
                     ui.add_space(10.0);
-                    ui.vertical(|ui| {
-                        ui.heading("VFX Player");
-                        ui.weak(lang.tr(
-                            "VFX uzmanları için ileri video oynatıcı",
-                            "Advanced Video Player for VFX Experts",
-                        ));
-                        ui.horizontal(|ui| {
-                            ui.weak(format!("v{APP_VERSION}"))
-                                .on_hover_text(lang.tr("Sürüm", "Version"));
-                            ui.weak("·");
-                            ui.weak("Windows");
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.add(egui::Image::new((logo, egui::vec2(52.0, 52.0))));
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            ui.heading("VFX Player");
+                            ui.weak(lang.tr(
+                                "VFX uzmanları için ileri video oynatıcı",
+                                "Advanced Video Player for VFX Experts",
+                            ));
+                            ui.horizontal(|ui| {
+                                ui.weak(format!("v{APP_VERSION}"))
+                                    .on_hover_text(lang.tr("Sürüm", "Version"));
+                                ui.weak("·");
+                                ui.weak("Windows");
+                            });
                         });
                     });
-                });
-                ui.add_space(8.0);
-                ui.label(lang.tr(
-                    "Murat Kirazkaya tarafından yapıldı",
-                    "Made by Murat Kirazkaya",
-                ));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("GitHub")
-                        .on_hover_text(REPO_URL)
-                        .clicked()
-                    {
-                        open_browser(REPO_URL);
-                    }
-                    if ui
-                        .button(lang.tr("Profil", "Profile"))
-                        .on_hover_text(ABOUT_URL)
-                        .clicked()
-                    {
-                        open_browser(ABOUT_URL);
-                    }
-                    if ui
-                        .button(lang.tr("Sürümler", "Releases"))
-                        .on_hover_text(REPO_RELEASES)
-                        .clicked()
-                    {
-                        open_browser(REPO_RELEASES);
-                    }
-                    if self.update_url.is_some() {
+                    ui.add_space(8.0);
+                    ui.label(lang.tr(
+                        "Murat Kirazkaya tarafından yapıldı",
+                        "Made by Murat Kirazkaya",
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
                         if ui
-                            .add(
-                                egui::Button::new(lang.tr("Güncelle", "Update"))
-                                    .fill(Color32::from_rgb(32, 140, 120)),
-                            )
-                            .on_hover_text(lang.tr(
-                                "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
-                                "Download, replace this exe, relaunch with the same args",
-                            ))
+                            .button("GitHub")
+                            .on_hover_text(REPO_URL)
                             .clicked()
                         {
-                            self.begin_update();
+                            open_browser(REPO_URL);
                         }
-                    }
-                });
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.strong(lang.tr("Ne yapar", "What it does"));
-                ui.add_space(4.0);
-                let groups: [(&str, &str, &[usize]); 4] = [
-                    ("İnceleme", "Review", &[0, 1, 2, 3, 4, 5, 6, 7, 18]),
-                    ("Zaman çizelgesi", "Timeline", &[8, 9, 10, 17, 19]),
-                    ("Döngü", "Loop", &[11, 12]),
-                    ("Uygulama", "App", &[13, 14, 15, 16]),
-                ];
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (tr, en, idxs) in groups {
-                            ui.weak(lang.tr(tr, en));
-                            ui.add_space(2.0);
-                            for i in idxs {
-                                if let Some((a, b)) = ABOUT_FEATURES.get(*i) {
-                                    ui.label(format!("   {}", lang.tr(a, b)));
-                                }
+                        if ui
+                            .button(lang.tr("Profil", "Profile"))
+                            .on_hover_text(ABOUT_URL)
+                            .clicked()
+                        {
+                            open_browser(ABOUT_URL);
+                        }
+                        if ui
+                            .button(lang.tr("Sürümler", "Releases"))
+                            .on_hover_text(REPO_RELEASES)
+                            .clicked()
+                        {
+                            open_browser(REPO_RELEASES);
+                        }
+                        if self.update_url.is_some() {
+                            if ui
+                                .add(
+                                    egui::Button::new(lang.tr("Güncelle", "Update"))
+                                        .fill(Color32::from_rgb(32, 140, 120)),
+                                )
+                                .on_hover_text(lang.tr(
+                                    "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
+                                    "Download, replace this exe, relaunch with the same args",
+                                ))
+                                .clicked()
+                            {
+                                self.begin_update();
                             }
-                            ui.add_space(8.0);
                         }
                     });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.strong(lang.tr("Ne yapar", "What it does"));
+                    ui.add_space(4.0);
+                    let groups: [(&str, &str, &[usize]); 4] = [
+                        ("İnceleme", "Review", &[0, 1, 2, 3, 4, 5, 6, 7, 18]),
+                        ("Zaman çizelgesi", "Timeline", &[8, 9, 10, 17, 19]),
+                        ("Döngü", "Loop", &[11, 12]),
+                        ("Uygulama", "App", &[13, 14, 15, 16]),
+                    ];
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (tr, en, idxs) in groups {
+                                ui.weak(lang.tr(tr, en));
+                                ui.add_space(2.0);
+                                for i in idxs {
+                                    if let Some((a, b)) = ABOUT_FEATURES.get(*i) {
+                                        ui.label(format!("   {}", lang.tr(a, b)));
+                                    }
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
+                });
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     self.about_open = false;
                 }
@@ -1102,13 +1240,23 @@ impl PlayerApp {
         self.accum = 0.0;
         if self.playing {
             if let Some(dec) = &self.decoder {
-                let dest = play_resume_frame(dec.current, dec.info.frame_count.saturating_sub(1));
-                if dest != dec.current {
+                let cur = dec.current;
+                let last = dec.info.frame_count.saturating_sub(1);
+                let dest = play_resume_frame(cur, last, self.ended);
+                self.log(format!(
+                    "play current={cur} last={last} ended={} dest={dest} seek={}",
+                    self.ended,
+                    dest != cur
+                ));
+                if dest != cur {
                     self.seek_to(ctx, dest);
                 }
+            } else {
+                self.log("play no decoder");
             }
             self.start_audio();
         } else {
+            self.log("pause");
             self.stop_audio();
         }
     }
@@ -1122,6 +1270,7 @@ impl PlayerApp {
             Some(loop_step(cur, delta, a, b) as i64 - cur as i64)
         });
         let delta = wrapped.unwrap_or(delta);
+        self.ended = false;
         if let Some(Err(e)) = self.decoder.as_mut().map(|d| d.step(delta)) {
             self.status = e;
         }
@@ -1138,9 +1287,13 @@ impl PlayerApp {
         let last = dec.info.frame_count.saturating_sub(1);
         let frame = frame.min(last);
         if dec.current == frame {
+            self.log(format!("seek skip already={frame}"));
             return;
         }
+        self.log(format!("seek {} -> {frame} last={last}", dec.current));
+        self.ended = false;
         if let Some(Err(e)) = self.decoder.as_mut().map(|d| d.seek(frame)) {
+            self.log(format!("seek fail {e}"));
             self.status = e;
         }
         self.sync_texture(ctx);
@@ -1357,6 +1510,7 @@ impl eframe::App for PlayerApp {
         self.poll_update(ctx);
         self.poll_update_state(ctx);
         self.show_about(ctx);
+        self.show_logs(ctx);
         self.show_update_modal(ctx);
         self.show_format_modal(ctx);
         if self.intro.is_none() {
@@ -1396,6 +1550,13 @@ impl eframe::App for PlayerApp {
             match self.decoder.as_mut().map(|d| d.advance()) {
                 Some(Ok(true)) => moved = true,
                 Some(Ok(false)) => {
+                    let cur = self.decoder.as_ref().map(|d| d.current).unwrap_or(0);
+                    let last = self
+                        .decoder
+                        .as_ref()
+                        .map(|d| d.info.frame_count.saturating_sub(1))
+                        .unwrap_or(0);
+                    self.log(format!("eof current={cur} last={last} loop={}", self.loop_on));
                     if self.loop_on {
                         if let Some((a, _)) = self.loop_range() {
                             self.seek_to(ctx, a);
@@ -1404,12 +1565,15 @@ impl eframe::App for PlayerApp {
                             continue;
                         }
                     }
+                    self.ended = true;
                     self.playing = false;
                     self.last_tick = None;
                     self.stop_audio();
                     break;
                 }
                 Some(Err(e)) => {
+                    self.log(format!("advance err {e}"));
+                    self.ended = true;
                     self.status = e;
                     self.playing = false;
                     self.stop_audio();
@@ -1501,6 +1665,13 @@ impl eframe::App for PlayerApp {
                         .clicked()
                     {
                         self.about_open = true;
+                    }
+                    if ui
+                        .button("L")
+                        .on_hover_text(lang.tr("Sistem günlüğü", "System log"))
+                        .clicked()
+                    {
+                        self.log_open = true;
                     }
                     if ui
                         .button(lang.tr("Odak", "Focus"))
@@ -2959,8 +3130,8 @@ fn paint_waveform(
     (rect, pointer_frame(ui, &resp, rect, view, total))
 }
 
-fn play_resume_frame(current: u64, last: u64) -> u64 {
-    if last == 0 || current >= last {
+fn play_resume_frame(current: u64, last: u64, ended: bool) -> u64 {
+    if ended || last == 0 || current >= last {
         0
     } else {
         current

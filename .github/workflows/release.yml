@@ -61,7 +61,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          $text = Get-Content CHANGELOG.md -Raw
+          $pat = "(?ms)^## (?:v)?$([regex]::Escape($v))\s*\r?\n(.*?)(?=^## |\z)"
+          if (-not ($text -match $pat) -or -not $Matches[1].Trim()) {
+            throw "CHANGELOG.md: add ## $v"
+          }
+          $body = $Matches[1].Trim()
+          $notes = "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg and yt-dlp are bundled.`n`n$body"
+          Set-Content -Path notes.md -Value $notes -Encoding utf8NoNewline
           gh release create "${{ steps.ver.outputs.tag }}" "target/release/vfx_editor.exe" `
             --title "${{ steps.ver.outputs.name }}" `
-            --notes "Windows x64. Download ``vfx_editor.exe`` — no installer, FFmpeg and yt-dlp are bundled." `
+            --notes-file notes.md `
             --latest
