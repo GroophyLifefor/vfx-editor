@@ -2,6 +2,11 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.8
+
+- Compare two clips with a wipe or side by side (B from file or Video2X)
+- Optional Video2X download (one-time prompt), GPU pick, upscale or frame interpolation
+
 ## 0.1.7
 
 - `--intro-video` records a ~30s scripted tour with captions on the preview

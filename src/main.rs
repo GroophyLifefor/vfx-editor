@@ -2,10 +2,13 @@
 
 mod audio;
 mod bundle;
+mod compare;
 mod decoder;
 mod tour;
+mod video2x;
 
 use audio::AudioTrack;
+use compare::Recipe;
 use decoder::{export_span, Decoder};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, FontId, IconData, Key, Modifiers, Pos2, Rect,
@@ -195,32 +198,60 @@ fn load_icon() -> IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png")
 }
 
-fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>, bool) {
+fn is_media_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO_EXTS.iter().any(|v| e.eq_ignore_ascii_case(v)))
+        .unwrap_or(false)
+}
+
+fn collect_open_paths(args: impl Iterator<Item = std::ffi::OsString>) -> (Option<PathBuf>, Option<PathBuf>) {
     let mut open = None;
+    let mut compare = None;
+    let mut args = args.peekable();
+    while let Some(a) = args.next() {
+        if a == "--intro-shots" || a == "--intro-video" {
+            let _ = args.next();
+            continue;
+        }
+        if a == "--updated" {
+            continue;
+        }
+        let p = PathBuf::from(a);
+        if p.to_string_lossy().starts_with('-') {
+            continue;
+        }
+        if open.is_none() {
+            open = Some(p);
+        } else if compare.is_none() && is_media_path(&p) {
+            compare = Some(p);
+        }
+    }
+    (open, compare)
+}
+
+fn parse_cli() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>, bool) {
     let mut shots = None;
     let mut video = None;
     let mut updated = false;
-    let mut args = std::env::args_os().skip(1);
+    let raw: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut args = raw.iter();
     while let Some(a) = args.next() {
         if a == "--intro-shots" {
-            shots = args.next().map(PathBuf::from);
+            shots = args.next().cloned().map(PathBuf::from);
         } else if a == "--intro-video" {
-            video = args.next().map(PathBuf::from);
+            video = args.next().cloned().map(PathBuf::from);
         } else if a == "--updated" {
             updated = true;
-        } else {
-            let p = PathBuf::from(a);
-            if !p.to_string_lossy().starts_with('-') {
-                open = Some(p);
-            }
         }
     }
-    (open, shots, video, updated)
+    let (open, compare) = collect_open_paths(raw.into_iter());
+    (open, compare, shots, video, updated)
 }
 
 fn main() -> eframe::Result {
     install_crash_hook();
-    let (open, shots, video, updated) = parse_cli();
+    let (open, compare, shots, video, updated) = parse_cli();
     let icon = load_icon();
     let size = if shots.is_some() || video.is_some() {
         [1280.0, 800.0]
@@ -237,7 +268,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "VFX Player",
         options,
-        Box::new(move |cc| Ok(Box::new(PlayerApp::new(cc, &icon, open, shots, video, updated)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PlayerApp::new(
+                cc, &icon, open, compare, shots, video, updated,
+            )))
+        }),
     )
 }
 
@@ -301,6 +336,16 @@ fn pan_from_origin(origin: Vec2, size: Vec2, avail: Vec2) -> Vec2 {
     )
 }
 
+fn fmt_bytes(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1} GB", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.0} MB", n as f64 / 1e6)
+    } else {
+        format!("{:.0} KB", n as f64 / 1e3)
+    }
+}
+
 fn remap_pan(pan: Vec2, old_size: Vec2, new_size: Vec2, avail: Vec2, anchor: Vec2) -> Vec2 {
     let origin = image_origin(old_size, avail, pan);
     let img = anchor - origin;
@@ -358,6 +403,7 @@ struct PlayerApp {
     volume: f32,
     dark: bool,
     pending_open: Option<PathBuf>,
+    pending_compare: Option<PathBuf>,
     intro: Option<IntroShots>,
     tour: Option<TourRun>,
     tl_zoom: f32,
@@ -367,6 +413,22 @@ struct PlayerApp {
     wave_on: bool,
     focus: bool,
     ended: bool,
+    compare: Option<CompareClip>,
+    wipe: f32,
+    wipe_drag: bool,
+    split: bool,
+    fps_pick: Option<(PathBuf, bool)>,
+    upscale_open: bool,
+    upscale_ask: bool,
+    upscale_installing: bool,
+    upscale_recipe: Recipe,
+    upscale_scale: u32,
+    upscale_device: u32,
+    upscale_best: bool,
+    upscale_devices: Vec<(u32, String)>,
+    upscale_rx: Option<mpsc::Receiver<UpscaleEv>>,
+    upscale_pid: std::sync::Arc<Mutex<Option<u32>>>,
+    upscale_status: String,
 }
 
 struct IntroShots {
@@ -388,6 +450,24 @@ struct TourRun {
     next_frame: Option<Instant>,
     want_shot: bool,
     sub: u8,
+}
+
+struct CompareClip {
+    decoder: Decoder,
+    texture: Option<TextureHandle>,
+    audio: Option<AudioTrack>,
+    sink: Option<rodio::Sink>,
+    volume: f32,
+    zoom_mode: ZoomMode,
+    zoom: f32,
+    pan: Vec2,
+    last_scale: f32,
+    tmp: bool,
+}
+
+enum UpscaleEv {
+    Status(String),
+    Done(Result<PathBuf, String>),
 }
 
 enum FetchEvent {
@@ -421,6 +501,7 @@ impl PlayerApp {
         cc: &eframe::CreationContext<'_>,
         icon: &IconData,
         pending_open: Option<PathBuf>,
+        pending_compare: Option<PathBuf>,
         intro_dir: Option<PathBuf>,
         tour_dest: Option<PathBuf>,
         from_update: bool,
@@ -494,6 +575,7 @@ impl PlayerApp {
             volume: load_volume(),
             dark,
             pending_open,
+            pending_compare,
             intro,
             tour: tour_dest.map(|dest| TourRun {
                 dest,
@@ -514,6 +596,22 @@ impl PlayerApp {
             wave_on: true,
             focus: false,
             ended: false,
+            compare: None,
+            wipe: 0.5,
+            wipe_drag: false,
+            split: false,
+            fps_pick: None,
+            upscale_open: false,
+            upscale_ask: false,
+            upscale_installing: false,
+            upscale_recipe: Recipe::AnimeFast,
+            upscale_scale: 4,
+            upscale_device: 0,
+            upscale_best: false,
+            upscale_devices: Vec::new(),
+            upscale_rx: None,
+            upscale_pid: std::sync::Arc::new(Mutex::new(None)),
+            upscale_status: String::new(),
         };
         app.log(format!(
             "start v{APP_VERSION} {} {}",
@@ -528,6 +626,9 @@ impl PlayerApp {
             app.spawn_update_check();
             if let Some(p) = app.pending_open.take() {
                 app.open_path(p, &cc.egui_ctx);
+            }
+            if let Some(p) = app.pending_compare.take() {
+                app.offer_compare(p, false, &cc.egui_ctx);
             }
         }
         app
@@ -946,6 +1047,7 @@ impl PlayerApp {
     }
 
     fn open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.close_compare();
         self.stop_audio();
         self.playing = false;
         self.last_tick = None;
@@ -1021,6 +1123,522 @@ impl PlayerApp {
             self.open_path(path, ctx);
         }
     }
+
+    fn timeline_len(&self) -> u64 {
+        let Some(d) = &self.decoder else {
+            return 1;
+        };
+        let Some(c) = &self.compare else {
+            return d.info.frame_count.max(1);
+        };
+        compare::timeline_len(
+            d.info.frame_count,
+            d.info.fps,
+            c.decoder.info.frame_count,
+            c.decoder.info.fps,
+        )
+    }
+
+    fn close_compare(&mut self) {
+        if let Some(mut c) = self.compare.take() {
+            if let Some(s) = c.sink.take() {
+                s.stop();
+            }
+            if c.tmp {
+                let _ = std::fs::remove_file(c.decoder.path());
+            }
+        }
+        self.wipe_drag = false;
+        self.split = false;
+        self.fps_pick = None;
+    }
+
+    fn offer_compare(&mut self, path: PathBuf, tmp: bool, ctx: &egui::Context) {
+        let (Some(d), Ok(ff)) = (&self.decoder, &self.ffmpeg) else {
+            return;
+        };
+        match decoder::probe(ff, &path) {
+            Ok(info) if compare::fps_differs(d.info.fps, info.fps) => {
+                self.fps_pick = Some((path, tmp));
+            }
+            Ok(_) => {
+                self.attach_compare(path, tmp);
+                self.sync_compare(ctx);
+            }
+            Err(e) => {
+                self.status = e;
+            }
+        }
+    }
+
+    fn attach_compare(&mut self, path: PathBuf, tmp: bool) {
+        let Ok(ff) = &self.ffmpeg else {
+            return;
+        };
+        match Decoder::open(ff.clone(), path) {
+            Ok(dec) => {
+                let audio = AudioTrack::load(ff, dec.path());
+                self.log(format!(
+                    "compare {} {}x{} fps={:.3} frames={}",
+                    dec.path().display(),
+                    dec.info.width,
+                    dec.info.height,
+                    dec.info.fps,
+                    dec.info.frame_count
+                ));
+                self.compare = Some(CompareClip {
+                    decoder: dec,
+                    texture: None,
+                    audio,
+                    sink: None,
+                    volume: 1.0,
+                    zoom_mode: ZoomMode::FitHeight,
+                    zoom: 1.0,
+                    pan: Vec2::ZERO,
+                    last_scale: 0.0,
+                    tmp,
+                });
+                self.fps_pick = None;
+                self.wipe = 0.5;
+            }
+            Err(e) => {
+                self.log(format!("compare fail {e}"));
+                self.status = e;
+            }
+        }
+    }
+
+    fn pick_compare(&mut self, ctx: &egui::Context) {
+        if self.decoder.is_none() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Video", VIDEO_EXTS)
+            .pick_file()
+        {
+            self.offer_compare(path, false, ctx);
+        }
+    }
+
+    fn save_compare(&mut self) {
+        let Some(c) = &self.compare else {
+            return;
+        };
+        let src = c.decoder.path().to_path_buf();
+        if let Some(dest) = rfd::FileDialog::new().add_filter("Video", VIDEO_EXTS).save_file() {
+            match std::fs::copy(&src, &dest) {
+                Ok(_) => {
+                    if let Some(c) = &mut self.compare {
+                        c.tmp = false;
+                    }
+                    self.status = dest.display().to_string();
+                    self.log(format!("compare saved {}", dest.display()));
+                }
+                Err(e) => self.status = format!("save: {e}"),
+            }
+        }
+    }
+
+    fn sync_compare(&mut self, ctx: &egui::Context) {
+        let Some(d) = &self.decoder else {
+            return;
+        };
+        let p_frame = self.playhead.unwrap_or(d.current);
+        let p_fps = d.info.fps;
+        let Some(c) = &mut self.compare else {
+            return;
+        };
+        let dest = compare::map_compare_frame(
+            p_frame,
+            p_fps,
+            c.decoder.info.frame_count,
+            c.decoder.info.fps,
+        );
+        if c.decoder.current != dest {
+            if let Err(e) = c.decoder.seek(dest) {
+                self.status = e;
+                return;
+            }
+        }
+        let size = [c.decoder.info.width as usize, c.decoder.info.height as usize];
+        let image = ColorImage::from_rgb(size, &c.decoder.rgb);
+        match &mut c.texture {
+            Some(tex) => tex.set(image, TextureOptions::NEAREST),
+            None => {
+                c.texture = Some(ctx.load_texture("compare", image, TextureOptions::NEAREST));
+            }
+        }
+    }
+
+    fn open_upscale(&mut self) {
+        if self.decoder.is_none() || self.compare.is_some() || self.upscale_rx.is_some() {
+            return;
+        }
+        if video2x::find_exe().is_none() {
+            self.upscale_ask = true;
+            return;
+        }
+        self.upscale_open = true;
+        self.upscale_status.clear();
+        if let Some(exe) = video2x::find_exe() {
+            self.upscale_devices = video2x::list_devices(&exe);
+            if let Some((id, _)) = self.upscale_devices.iter().max_by_key(|(id, name)| {
+                let n = name.to_ascii_lowercase();
+                let score = if n.contains("nvidia") || n.contains("geforce") || n.contains("radeon")
+                {
+                    10
+                } else {
+                    0
+                };
+                score + *id
+            }) {
+                self.upscale_device = *id;
+            }
+        }
+    }
+
+    fn estimate_upscale(&self) -> Option<(u64, f64, u32)> {
+        let d = self.decoder.as_ref()?;
+        let src = std::fs::metadata(d.path()).ok()?.len();
+        let scale = if self.upscale_recipe.is_rife() {
+            1
+        } else {
+            self.upscale_scale
+        };
+        let mult = if self.upscale_recipe.is_rife() { 2.0 } else { 1.0 };
+        let bytes = compare::estimate_bytes(src, scale, mult);
+        let secs = d.info.frame_count as f64 / d.info.fps.max(0.001);
+        Some((bytes, secs, scale))
+    }
+
+    fn start_upscale(&mut self) {
+        let Some(d) = &self.decoder else {
+            return;
+        };
+        if self.upscale_rx.is_some() {
+            return;
+        }
+        if video2x::find_exe().is_none() {
+            self.upscale_open = false;
+            self.upscale_ask = true;
+            return;
+        }
+        let input = d.path().to_path_buf();
+        let dest = bundle::data_dir().join(format!(
+            "up-{}.mp4",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        let recipe = self.upscale_recipe;
+        let scale = self.upscale_scale;
+        let device = self.upscale_device;
+        let best = self.upscale_best;
+        let (tx, rx) = mpsc::channel();
+        self.upscale_rx = Some(rx);
+        self.upscale_open = false;
+        self.upscale_status = "Video2X…".into();
+        self.log(format!(
+            "v2x {} {} d={device}",
+            recipe.processor(),
+            recipe.model()
+        ));
+        let pid_slot = self.upscale_pid.clone();
+        std::thread::spawn(move || {
+            let Some(exe) = video2x::find_exe() else {
+                let _ = tx.send(UpscaleEv::Done(Err("Video2X missing".into())));
+                return;
+            };
+            let _ = tx.send(UpscaleEv::Status("Video2X running…".into()));
+            match video2x::spawn(&exe, &input, &dest, recipe, scale, device, best) {
+                Ok(mut child) => {
+                    *pid_slot.lock().unwrap() = Some(child.id());
+                    let tail = video2x::pump_progress(&mut child, &{
+                        let tx = tx.clone();
+                        let (ptx, prx) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            while let Ok(s) = prx.recv() {
+                                let _ = tx.send(UpscaleEv::Status(s));
+                            }
+                        });
+                        ptx
+                    });
+                    let _ = child.wait();
+                    *pid_slot.lock().unwrap() = None;
+                    // Video2X can exit non-zero after a good write (no console / stdin).
+                    if video2x::output_ready(&dest) {
+                        let _ = tx.send(UpscaleEv::Done(Ok(dest)));
+                    } else {
+                        let msg = if tail.is_empty() {
+                            "Video2X failed".into()
+                        } else {
+                            format!("Video2X failed: {tail}")
+                        };
+                        let _ = tx.send(UpscaleEv::Done(Err(msg)));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(UpscaleEv::Done(Err(e)));
+                }
+            }
+        });
+    }
+
+    fn start_v2x_install(&mut self) {
+        if self.upscale_rx.is_some() || video2x::find_exe().is_some() {
+            self.upscale_ask = false;
+            if video2x::find_exe().is_some() {
+                self.open_upscale();
+            }
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.upscale_rx = Some(rx);
+        self.upscale_ask = false;
+        self.upscale_installing = true;
+        self.upscale_status = "Video2X…".into();
+        self.status = self
+            .lang()
+            .tr("Video2X indiriliyor…", "Downloading Video2X…")
+            .into();
+        std::thread::spawn(move || {
+            let (itx, irx) = mpsc::channel();
+            let tx_i = tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(s) = irx.recv() {
+                    let _ = tx_i.send(UpscaleEv::Status(s));
+                }
+            });
+            match video2x::install(&itx) {
+                Ok(p) => {
+                    let _ = tx.send(UpscaleEv::Done(Ok(p)));
+                }
+                Err(e) => {
+                    let _ = tx.send(UpscaleEv::Done(Err(e)));
+                }
+            }
+        });
+    }
+
+    fn cancel_upscale(&mut self) {
+        if let Some(pid) = self.upscale_pid.lock().unwrap().take() {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F", "/T"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+        self.upscale_rx = None;
+        self.upscale_installing = false;
+        self.upscale_status.clear();
+        self.status = self.lang().tr("Upscale iptal", "Upscale cancelled").into();
+    }
+
+    fn poll_upscale(&mut self, ctx: &egui::Context) {
+        loop {
+            let ev = match self.upscale_rx.as_ref().map(|rx| rx.try_recv()) {
+                None => return,
+                Some(Ok(v)) => v,
+                Some(Err(mpsc::TryRecvError::Empty)) => {
+                    ctx.request_repaint();
+                    return;
+                }
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.upscale_rx = None;
+                    return;
+                }
+            };
+            match ev {
+                UpscaleEv::Status(s) => {
+                    if crate::compare::parse_progress(&s).is_none() && !s.contains("frame=") {
+                        self.log(s.clone());
+                    }
+                    self.upscale_status = s.clone();
+                    self.status = s;
+                    ctx.request_repaint();
+                }
+                UpscaleEv::Done(v) => {
+                    let installing = self.upscale_installing;
+                    self.upscale_installing = false;
+                    self.upscale_rx = None;
+                    *self.upscale_pid.lock().unwrap() = None;
+                    match v {
+                        Ok(_) if installing => {
+                            self.status = self.lang().tr("Video2X hazır", "Video2X ready").into();
+                            self.open_upscale();
+                        }
+                        Ok(path) => {
+                            self.status = self
+                                .lang()
+                                .tr("Karşılaştırma hazır", "Compare ready")
+                                .into();
+                            self.offer_compare(path, true, ctx);
+                        }
+                        Err(e) => {
+                            self.log(e.clone());
+                            self.status = e.lines().next().unwrap_or("Video2X failed").into();
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn show_fps_pick(&mut self, ctx: &egui::Context) {
+        let Some((path, tmp)) = self.fps_pick.clone() else {
+            return;
+        };
+        let lang = self.lang();
+        let p_fps = self.decoder.as_ref().map(|d| d.info.fps).unwrap_or(24.0);
+        let c_fps = self
+            .ffmpeg
+            .as_ref()
+            .ok()
+            .and_then(|ff| decoder::probe(ff, &path).ok())
+            .map(|i| i.fps)
+            .unwrap_or(p_fps);
+        egui::Window::new(lang.tr("Kare hızı", "Frame rate"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(lang.tr(
+                    "İki videonun FPS’i farklı. Hangisi oynatma hızı olsun?",
+                    "The two clips have different FPS. Which one sets playback speed?",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(format!("A  {p_fps:.2}")).clicked() {
+                        self.playback_fps = p_fps;
+                        self.attach_compare(path.clone(), tmp);
+                        self.sync_compare(ctx);
+                    }
+                    if ui.button(format!("B  {c_fps:.2}")).clicked() {
+                        self.playback_fps = c_fps;
+                        self.attach_compare(path.clone(), tmp);
+                        self.sync_compare(ctx);
+                    }
+                    if ui.button(lang.tr("Vazgeç", "Cancel")).clicked() {
+                        self.fps_pick = None;
+                    }
+                });
+            });
+    }
+
+    fn show_upscale_ask(&mut self, ctx: &egui::Context) {
+        if !self.upscale_ask {
+            return;
+        }
+        let lang = self.lang();
+        let mut go = false;
+        let mut no = false;
+        egui::Window::new("Video2X")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(lang.tr(
+                    "Video2X henüz yok. İlk kullanımda bir kez indirilir (≈190 MB). Sonra tekrar inmez.",
+                    "Video2X is not installed. First use downloads it once (≈190 MB). It will not download again.",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(lang.tr("İndir", "Download")).clicked() {
+                        go = true;
+                    }
+                    if ui.button(lang.tr("Vazgeç", "Cancel")).clicked() {
+                        no = true;
+                    }
+                });
+            });
+        if go {
+            self.start_v2x_install();
+        }
+        if no {
+            self.upscale_ask = false;
+        }
+    }
+
+    fn show_upscale(&mut self, ctx: &egui::Context) {
+        if !self.upscale_open {
+            return;
+        }
+        let lang = self.lang();
+        let est = self.estimate_upscale();
+        let mut start = false;
+        let mut close = false;
+        egui::Window::new(lang.tr("Yükselt", "Upscale"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(lang.tr("Anime", "Anime"));
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.upscale_recipe, Recipe::AnimeFast, lang.tr("Orta, hızlı", "Medium, fast"));
+                    ui.radio_value(&mut self.upscale_recipe, Recipe::AnimeSlow, lang.tr("İyi, yavaş", "Good, slow"));
+                });
+                ui.label(lang.tr("Genel", "General"));
+                ui.radio_value(&mut self.upscale_recipe, Recipe::General, lang.tr("En iyi", "Best"));
+                ui.label(lang.tr("Akışkanlık (FPS)", "Smoothness (FPS)"));
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeLite, lang.tr("İyi, hızlı", "Good, fast"));
+                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeMid, lang.tr("İyi, orta", "Good, medium"));
+                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeBest, lang.tr("En iyi, kararsız", "Best, unstable"));
+                });
+                if !self.upscale_recipe.is_rife() {
+                    ui.horizontal(|ui| {
+                        ui.label(lang.tr("Ölçek", "Scale"));
+                        ui.radio_value(&mut self.upscale_scale, 2, "2×");
+                        ui.radio_value(&mut self.upscale_scale, 4, "4×");
+                    });
+                }
+                if !self.upscale_devices.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("GPU");
+                        egui::ComboBox::from_id_salt("v2x_gpu")
+                            .selected_text(
+                                self.upscale_devices
+                                    .iter()
+                                    .find(|(id, _)| *id == self.upscale_device)
+                                    .map(|(_, n)| n.as_str())
+                                    .unwrap_or("GPU"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &self.upscale_devices {
+                                    ui.selectable_value(&mut self.upscale_device, *id, name);
+                                }
+                            });
+                    });
+                }
+                ui.radio_value(&mut self.upscale_best, false, "Output for Optimal Quality (Recommended)");
+                ui.radio_value(&mut self.upscale_best, true, "Output for Best Quality");
+                if let Some((bytes, secs, scale)) = est {
+                    ui.weak(format!(
+                        "{}  ·  {:.0}s  ·  {}×",
+                        fmt_bytes(bytes),
+                        secs,
+                        scale
+                    ));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(lang.tr("Başla", "Start")).clicked() {
+                        start = true;
+                    }
+                    if ui.button(lang.tr("Kapat", "Close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if start {
+            self.start_upscale();
+        }
+        if close {
+            self.upscale_open = false;
+        }
+    }
+
 
     fn start_url(&mut self) {
         if self.fetch.is_some() {
@@ -1574,6 +2192,7 @@ impl PlayerApp {
             self.status = e;
         }
         self.sync_texture(ctx);
+        self.sync_compare(ctx);
         if self.playing {
             self.start_audio();
         }
@@ -1583,19 +2202,35 @@ impl PlayerApp {
         let Some(dec) = &self.decoder else {
             return;
         };
-        let last = dec.info.frame_count.saturating_sub(1);
+        let p_last = dec.info.frame_count.saturating_sub(1);
+        let last = if self.compare.is_some() {
+            self.timeline_len().saturating_sub(1)
+        } else {
+            p_last
+        };
         let frame = frame.min(last);
-        if dec.current == frame {
-            self.log(format!("seek skip already={frame}"));
+        let dest = frame.min(p_last);
+        if self.compare.is_some() && frame > p_last {
+            self.playhead = Some(frame);
+        } else if self.compare.is_some() {
+            self.playhead = None;
+        }
+        let already = dec.current;
+        if already == dest && (self.compare.is_none() || frame <= p_last) {
+            self.log(format!("seek skip already={dest}"));
+            self.sync_compare(ctx);
             return;
         }
-        self.log(format!("seek {} -> {frame} last={last}", dec.current));
+        self.log(format!("seek {already} -> {dest} last={p_last}"));
         self.ended = false;
-        if let Some(Err(e)) = self.decoder.as_mut().map(|d| d.seek(frame)) {
-            self.log(format!("seek fail {e}"));
-            self.status = e;
+        if dest != already {
+            if let Some(Err(e)) = self.decoder.as_mut().map(|d| d.seek(dest)) {
+                self.log(format!("seek fail {e}"));
+                self.status = e;
+            }
         }
         self.sync_texture(ctx);
+        self.sync_compare(ctx);
     }
 
     fn scrub_to(&mut self, ctx: &egui::Context, frame: u64, force: bool) {
@@ -1687,6 +2322,11 @@ impl PlayerApp {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
+        if let Some(c) = &mut self.compare {
+            if let Some(sink) = c.sink.take() {
+                sink.stop();
+            }
+        }
     }
 
     fn start_audio(&mut self) {
@@ -1722,6 +2362,52 @@ impl PlayerApp {
         ));
         sink.play();
         self.sink = Some(sink);
+        self.start_compare_audio();
+    }
+
+    fn start_compare_audio(&mut self) {
+        let Some(c) = &self.compare else {
+            return;
+        };
+        let Some(audio) = &c.audio else {
+            return;
+        };
+        let Some(dec) = &self.decoder else {
+            return;
+        };
+        let p_frame = self.playhead.unwrap_or(dec.current);
+        let mapped = compare::map_compare_frame(
+            p_frame,
+            dec.info.fps,
+            c.decoder.info.frame_count,
+            c.decoder.info.fps,
+        );
+        let t = mapped as f64 / c.decoder.info.fps.max(0.001);
+        let speed = (self.playback_fps / c.decoder.info.fps).clamp(0.05, 8.0) as f32;
+        let buf = audio.pcm_from(t);
+        if buf.is_empty() {
+            return;
+        }
+        let vol = c.volume;
+        let ch = audio.channels;
+        let sr = audio.sample_rate;
+        if self.output.is_none() {
+            self.output = rodio::OutputStreamBuilder::open_default_stream().ok();
+        }
+        let Some(out) = self.output.as_ref() else {
+            return;
+        };
+        let sink = rodio::Sink::connect_new(out.mixer());
+        sink.set_speed(speed);
+        sink.set_volume(vol);
+        sink.append(rodio::buffer::SamplesBuffer::new(ch, sr, buf));
+        sink.play();
+        if let Some(c) = &mut self.compare {
+            if let Some(old) = c.sink.take() {
+                old.stop();
+            }
+            c.sink = Some(sink);
+        }
     }
 
     fn sync_audio_speed(&mut self) {
@@ -1738,6 +2424,11 @@ impl PlayerApp {
     fn apply_volume(&mut self) {
         if let Some(sink) = &self.sink {
             sink.set_volume(self.volume);
+        }
+        if let Some(c) = &self.compare {
+            if let Some(sink) = &c.sink {
+                sink.set_volume(c.volume);
+            }
         }
     }
 
@@ -1808,19 +2499,35 @@ impl eframe::App for PlayerApp {
         self.poll_export(ctx);
         self.poll_update(ctx);
         self.poll_update_state(ctx);
+        self.poll_upscale(ctx);
         self.show_about(ctx);
         self.show_logs(ctx);
         self.show_update_modal(ctx);
         self.show_format_modal(ctx);
+        self.show_upscale_ask(ctx);
+        self.show_upscale(ctx);
+        self.show_fps_pick(ctx);
         if self.intro.is_none() && self.tour.is_none() {
             if let Some(p) = self.pending_open.take() {
                 self.open_path(p, ctx);
             }
+            if let Some(p) = self.pending_compare.take() {
+                self.offer_compare(p, false, ctx);
+            }
         }
         self.tick_intro(ctx);
         if self.lang.is_some() && self.tour.is_none() {
-            let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-            if let Some(path) = dropped {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            if dropped.len() >= 2 {
+                self.open_path(dropped[0].clone(), ctx);
+                self.offer_compare(dropped[1].clone(), false, ctx);
+            } else if let Some(path) = dropped.into_iter().next() {
                 self.open_path(path, ctx);
             }
             self.handle_keys(ctx);
@@ -1849,6 +2556,21 @@ impl eframe::App for PlayerApp {
             match self.decoder.as_mut().map(|d| d.advance()) {
                 Some(Ok(true)) => moved = true,
                 Some(Ok(false)) => {
+                    if self.compare.is_some() {
+                        let p_last = self
+                            .decoder
+                            .as_ref()
+                            .map(|d| d.info.frame_count.saturating_sub(1))
+                            .unwrap_or(0);
+                        let tl = self.timeline_len().saturating_sub(1);
+                        let cur = self.playhead.unwrap_or(p_last);
+                        if cur < tl {
+                            self.playhead = Some(cur + 1);
+                            self.sync_compare(ctx);
+                            moved = true;
+                            continue;
+                        }
+                    }
                     let cur = self.decoder.as_ref().map(|d| d.current).unwrap_or(0);
                     let last = self
                         .decoder
@@ -1883,6 +2605,7 @@ impl eframe::App for PlayerApp {
         }
         if moved {
             self.sync_texture(ctx);
+            self.sync_compare(ctx);
         }
         ctx.request_repaint();
     }
@@ -1960,6 +2683,62 @@ impl eframe::App for PlayerApp {
                         self.start_url();
                     }
                 });
+                if self.decoder.is_some() && self.compare.is_none() && self.tour.is_none() {
+                    if ui
+                        .button(lang.tr("Yükselt", "Upscale"))
+                        .on_hover_text(lang.tr(
+                            "Video2X ile yükselt, B olarak aç",
+                            "Upscale with Video2X, open as B",
+                        ))
+                        .clicked()
+                    {
+                        self.open_upscale();
+                    }
+                    if ui
+                        .button(lang.tr("Karşılaştır", "Compare"))
+                        .on_hover_text(lang.tr("İkinci video (B)", "Second video (B)"))
+                        .clicked()
+                    {
+                        self.pick_compare(&ctx);
+                    }
+                }
+                if self.compare.is_some() {
+                    let split_lbl = if self.split {
+                        lang.tr("Wipe", "Wipe")
+                    } else {
+                        lang.tr("Yan yana", "Side by side")
+                    };
+                    if ui
+                        .button(split_lbl)
+                        .on_hover_text(lang.tr(
+                            "Wipe veya iki tam kare",
+                            "Wipe or two full frames",
+                        ))
+                        .clicked()
+                    {
+                        self.split = !self.split;
+                        self.wipe_drag = false;
+                        self.last_scale = 0.0;
+                        if let Some(c) = &mut self.compare {
+                            c.last_scale = 0.0;
+                        }
+                    }
+                    if ui
+                        .button(lang.tr("Kaydet B", "Save B"))
+                        .on_hover_text(lang.tr("B’yi kaydet", "Save B"))
+                        .clicked()
+                    {
+                        self.save_compare();
+                    }
+                    if ui.button(lang.tr("B kapat", "Close B")).clicked() {
+                        self.close_compare();
+                    }
+                }
+                if self.upscale_rx.is_some() {
+                    if ui.button(lang.tr("İptal", "Cancel")).clicked() {
+                        self.cancel_upscale();
+                    }
+                }
                 ui.separator();
                 let status = self.status.clone();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2058,7 +2837,7 @@ impl eframe::App for PlayerApp {
             let range = self.loop_range();
             if let Some((total, shown, fps)) = self.decoder.as_ref().map(|d| {
                 (
-                    d.info.frame_count.max(1),
+                    self.timeline_len(),
                     self.playhead.unwrap_or(d.current),
                     d.info.fps,
                 )
@@ -2119,11 +2898,7 @@ impl eframe::App for PlayerApp {
                 ui.add_space(4.0);
             }
             if let (Some(f), Some(rect)) = (hit_frame, hit_rect) {
-                let total = self
-                    .decoder
-                    .as_ref()
-                    .map(|d| d.info.frame_count.max(1))
-                    .unwrap_or(1);
+                let total = self.timeline_len();
                 let shift = ui.input(|i| i.modifiers.shift);
                 let pos_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
                 if self.range_drag.is_none() && !self.scrubbing {
@@ -2320,9 +3095,44 @@ impl eframe::App for PlayerApp {
                                         self.apply_volume();
                                         save_volume(self.volume);
                                     }
-                                    ui.colored_label(vol_c, format!("{vol_pct:.0}%"));
+                                    ui.colored_label(
+                                        vol_c,
+                                        if self.compare.is_some() {
+                                            format!("A {vol_pct:.0}%")
+                                        } else {
+                                            format!("{vol_pct:.0}%")
+                                        },
+                                    );
                                 },
                             );
+                            if self.compare.is_some() {
+                                let mut vol_b = self
+                                    .compare
+                                    .as_ref()
+                                    .map(|c| (c.volume * 100.0).round())
+                                    .unwrap_or(100.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(148.0, 20.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.weak("♪B");
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut vol_b, 0.0..=125.0)
+                                                    .show_value(false)
+                                                    .trailing_fill(true),
+                                            )
+                                            .changed()
+                                        {
+                                            if let Some(c) = &mut self.compare {
+                                                c.volume = (vol_b / 100.0).clamp(0.0, 1.25);
+                                            }
+                                            self.apply_volume();
+                                        }
+                                        ui.label(format!("{vol_b:.0}%"));
+                                    },
+                                );
+                            }
                         });
                     });
                 });
@@ -2459,15 +3269,65 @@ impl eframe::App for PlayerApp {
             if let Some((tex_id, w, h)) = self.texture.as_ref().zip(self.decoder.as_ref()).map(
                 |(tex, dec)| (tex.id(), dec.info.width as f32, dec.info.height as f32),
             ) {
+                let split = self.compare.is_some() && self.split;
+                let mid = rect.center().x;
+                let wx = if split {
+                    mid
+                } else {
+                    rect.left() + self.wipe * rect.width()
+                };
+                let a_rect = if split {
+                    Rect::from_min_max(rect.min, Pos2::new(mid, rect.max.y))
+                } else {
+                    rect
+                };
+                let a_avail = a_rect.size();
+                let b_rect = if split {
+                    Rect::from_min_max(Pos2::new(mid, rect.min.y), rect.max)
+                } else {
+                    rect
+                };
+                let b_avail = b_rect.size();
+                let on_b = self.compare.is_some()
+                    && resp.hover_pos().is_some_and(|p| p.x > wx);
                 if resp.hovered() {
                     let zdelta = ui.input(|i| i.zoom_delta());
                     if (zdelta - 1.0).abs() > 0.001 {
-                        let current = view_scale(avail.x, avail.y, w, h, self.zoom_mode, self.zoom);
-                        self.zoom_mode = ZoomMode::Manual;
-                        self.zoom = (current * zdelta).clamp(ZOOM_MIN, ZOOM_MAX);
+                        if on_b {
+                            if let Some(c) = &mut self.compare {
+                                let (bw, bh) = (
+                                    c.decoder.info.width as f32,
+                                    c.decoder.info.height as f32,
+                                );
+                                let current =
+                                    view_scale(b_avail.x, b_avail.y, bw, bh, c.zoom_mode, c.zoom);
+                                c.zoom_mode = ZoomMode::Manual;
+                                c.zoom = (current * zdelta).clamp(ZOOM_MIN, ZOOM_MAX);
+                            }
+                        } else {
+                            let current =
+                                view_scale(a_avail.x, a_avail.y, w, h, self.zoom_mode, self.zoom);
+                            self.zoom_mode = ZoomMode::Manual;
+                            self.zoom = (current * zdelta).clamp(ZOOM_MIN, ZOOM_MAX);
+                        }
                     }
                 }
-                let scale = view_scale(avail.x, avail.y, w, h, self.zoom_mode, self.zoom);
+                if self.compare.is_some() && !split {
+                    if resp.drag_started() {
+                        self.wipe_drag = resp
+                            .hover_pos()
+                            .is_some_and(|p| (p.x - wx).abs() < 10.0);
+                    }
+                    if !resp.dragged() {
+                        self.wipe_drag = false;
+                    }
+                    if self.wipe_drag {
+                        if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                            self.wipe = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.05, 0.95);
+                        }
+                    }
+                }
+                let scale = view_scale(a_avail.x, a_avail.y, w, h, self.zoom_mode, self.zoom);
                 if self.zoom_mode != ZoomMode::Manual {
                     self.zoom = scale;
                 }
@@ -2476,31 +3336,90 @@ impl eframe::App for PlayerApp {
                     let old_size = egui::vec2(w * self.last_scale, h * self.last_scale);
                     let anchor = resp
                         .hover_pos()
-                        .map(|p| p - rect.min)
-                        .unwrap_or(avail * 0.5);
-                    self.pan = remap_pan(self.pan, old_size, size, avail, anchor);
+                        .map(|p| p - a_rect.min)
+                        .unwrap_or(a_avail * 0.5);
+                    self.pan = remap_pan(self.pan, old_size, size, a_avail, anchor);
                 }
                 self.last_scale = scale;
-                let overflowing = size.x > avail.x + 0.5 || size.y > avail.y + 0.5;
-                if overflowing && resp.dragged() {
+                let overflowing = size.x > a_avail.x + 0.5 || size.y > a_avail.y + 0.5;
+                if overflowing && resp.dragged() && !self.wipe_drag && !on_b {
                     self.pan -= resp.drag_delta();
                 }
-                self.pan = pan_from_origin(image_origin(size, avail, self.pan), size, avail);
-                if overflowing {
+                self.pan = pan_from_origin(image_origin(size, a_avail, self.pan), size, a_avail);
+                if overflowing && !self.wipe_drag {
                     let _ = resp.clone().on_hover_cursor(if resp.dragged() {
                         CursorIcon::Grabbing
                     } else {
                         CursorIcon::Grab
                     });
                 }
-                let origin = image_origin(size, avail, self.pan);
-                let dest = Rect::from_min_size(rect.min + origin, size);
-                ui.painter_at(rect).image(
+                if self.compare.is_some() && !split {
+                    let wx_now = rect.left() + self.wipe * rect.width();
+                    let near_wipe = resp
+                        .hover_pos()
+                        .is_some_and(|p| (p.x - wx_now).abs() < 10.0);
+                    if near_wipe || self.wipe_drag {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                }
+                let origin = image_origin(size, a_avail, self.pan);
+                let dest = Rect::from_min_size(a_rect.min + origin, size);
+                ui.painter_at(a_rect).image(
                     tex_id,
                     dest,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                if let Some(c) = &mut self.compare {
+                    if let Some(tex) = &c.texture {
+                        let bw = c.decoder.info.width as f32;
+                        let bh = c.decoder.info.height as f32;
+                        let bscale = view_scale(b_avail.x, b_avail.y, bw, bh, c.zoom_mode, c.zoom);
+                        if c.zoom_mode != ZoomMode::Manual {
+                            c.zoom = bscale;
+                        }
+                        let bsize = egui::vec2(bw * bscale, bh * bscale);
+                        if c.last_scale > 0.0 && (bscale - c.last_scale).abs() > 1e-5 {
+                            let old = egui::vec2(bw * c.last_scale, bh * c.last_scale);
+                            let anchor = resp
+                                .hover_pos()
+                                .map(|p| p - b_rect.min)
+                                .unwrap_or(b_avail * 0.5);
+                            c.pan = remap_pan(c.pan, old, bsize, b_avail, anchor);
+                        }
+                        c.last_scale = bscale;
+                        if on_b && resp.dragged() && !self.wipe_drag {
+                            let overflow_b = bsize.x > b_avail.x + 0.5 || bsize.y > b_avail.y + 0.5;
+                            if overflow_b {
+                                c.pan -= resp.drag_delta();
+                            }
+                        }
+                        c.pan = pan_from_origin(image_origin(bsize, b_avail, c.pan), bsize, b_avail);
+                        let bdest = Rect::from_min_size(
+                            b_rect.min + image_origin(bsize, b_avail, c.pan),
+                            bsize,
+                        );
+                        let clip = if split {
+                            b_rect
+                        } else {
+                            Rect::from_min_max(
+                                Pos2::new(wx, rect.top()),
+                                rect.right_bottom(),
+                            )
+                        };
+                        ui.painter_at(clip).image(
+                            tex.id(),
+                            bdest,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        ui.painter().vline(
+                            wx,
+                            rect.y_range(),
+                            Stroke::new(2.0_f32, Color32::from_rgb(255, 200, 80)),
+                        );
+                    }
+                }
             } else {
                 ui.painter().text(
                     rect.center(),

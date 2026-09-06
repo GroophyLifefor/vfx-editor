@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read};
+use std::io::{BufReader, ErrorKind, Read};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -53,11 +53,11 @@ impl Decoder {
             return Ok(true);
         }
         match self.read_frame() {
-            Ok(()) => {
+            Ok(true) => {
                 self.current += 1;
                 Ok(true)
             }
-            Err(_) => {
+            Ok(false) | Err(_) => {
                 self.stop();
                 Ok(false)
             }
@@ -133,21 +133,39 @@ impl Decoder {
             .ok_or_else(|| "ffmpeg stdout missing".to_string())?;
         self.child = Some(child);
         self.stdout = Some(BufReader::with_capacity(1 << 20, stdout));
-        self.read_frame()?;
-        self.current = start_frame;
-        Ok(())
+        match self.read_frame()? {
+            true => {
+                self.current = start_frame;
+                Ok(())
+            }
+            false => {
+                self.stop();
+                if start_frame == 0 && self.rgb.len() != self.frame_bytes() {
+                    return Err("empty video".into());
+                }
+                self.current = start_frame;
+                Ok(())
+            }
+        }
     }
 
-    fn read_frame(&mut self) -> Result<(), String> {
+    fn read_frame(&mut self) -> Result<bool, String> {
         let n = self.frame_bytes();
-        self.rgb.resize(n, 0);
+        let mut buf = vec![0u8; n];
         let stdout = self
             .stdout
             .as_mut()
             .ok_or_else(|| "decoder not running".to_string())?;
-        stdout
-            .read_exact(&mut self.rgb)
-            .map_err(|e| format!("read frame: {e}"))
+        match stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                self.rgb = buf;
+                Ok(true)
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe) => {
+                Ok(false)
+            }
+            Err(e) => Err(format!("read frame: {e}")),
+        }
     }
 
     fn stop(&mut self) {
@@ -368,5 +386,6 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':
         assert_eq!(dec.current, count.saturating_sub(1 + 10));
         dec.step(1).expect("fwd 1");
         assert_eq!(dec.current, count.saturating_sub(1 + 9));
+        dec.seek(10_000).expect("past end is eof not error");
     }
 }

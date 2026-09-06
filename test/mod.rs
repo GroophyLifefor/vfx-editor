@@ -1,3 +1,5 @@
+mod cli;
+mod compare;
 mod crash;
 mod formats;
 mod theme;
