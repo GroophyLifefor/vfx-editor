@@ -1,4 +1,3 @@
-use crate::compare::Recipe;
 use crate::bundle;
 use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
@@ -91,11 +90,16 @@ pub fn list_devices(exe: &Path) -> Vec<(u32, String)> {
     list
 }
 
+/// Spawn Video2X for a single pass. `processor`/`model` come from `compare::UpRecipe` or
+/// `compare::RifeRecipe`; `is_rife` picks the RIFE vs RealESRGAN argument shape.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     exe: &Path,
     input: &Path,
     output: &Path,
-    recipe: Recipe,
+    processor: &str,
+    model: &str,
+    is_rife: bool,
     scale: u32,
     device: u32,
     best_encode: bool,
@@ -103,14 +107,14 @@ pub fn spawn(
     let mut cmd = Command::new(exe);
     cmd.current_dir(exe.parent().unwrap_or(exe));
     cmd.arg("-i").arg(input).arg("-o").arg(output);
-    cmd.arg("-p").arg(recipe.processor());
+    cmd.arg("-p").arg(processor);
     cmd.arg("-d").arg(device.to_string());
-    if recipe.is_rife() {
+    if is_rife {
         cmd.arg("-m").arg("2");
-        cmd.arg("--rife-model").arg(recipe.model());
+        cmd.arg("--rife-model").arg(model);
     } else {
         cmd.arg("-s").arg(scale.max(2).to_string());
-        cmd.arg("--realesrgan-model").arg(recipe.model());
+        cmd.arg("--realesrgan-model").arg(model);
     }
     cmd.arg("-c").arg("libx264");
     cmd.arg("-e").arg("crf=23");
@@ -138,7 +142,8 @@ pub fn pump_progress(child: &mut Child, tx: &Sender<String>) -> String {
         if t.is_empty() {
             return;
         }
-        let _ = tx.send(line.clone());
+        // ponytail: non-progress stderr chatter is noisy (RIFE/RealESRGAN print a lot); keep it
+        // out of the live log and only surface it if the run ends up failing.
         tail.push(line);
         if tail.len() > 40 {
             tail.remove(0);

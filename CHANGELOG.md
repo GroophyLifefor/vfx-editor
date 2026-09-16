@@ -2,6 +2,12 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.9
+
+- Upscale replaced by Enhancements: cut dead frames, interpolate and upscale, chainable in one run
+- Enhancements dialog shows a live pipeline strip and per-stage progress
+- Output name previews the applied stages, e.g. `clip - no dead frames - upscaled.mp4`
+
 ## 0.1.8
 
 - Compare two clips with a wipe or side by side (B from file or Video2X)

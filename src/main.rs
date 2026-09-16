@@ -4,12 +4,14 @@ mod audio;
 mod bundle;
 mod compare;
 mod decoder;
+mod enhance;
 mod tour;
 mod video2x;
 
 use audio::AudioTrack;
-use compare::Recipe;
+use compare::{RifeRecipe, UpRecipe};
 use decoder::{export_span, Decoder};
+use enhance::Stage;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, FontId, IconData, Key, Modifiers, Pos2, Rect,
     Sense, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -418,17 +420,28 @@ struct PlayerApp {
     wipe_drag: bool,
     split: bool,
     fps_pick: Option<(PathBuf, bool)>,
-    upscale_open: bool,
-    upscale_ask: bool,
-    upscale_installing: bool,
-    upscale_recipe: Recipe,
-    upscale_scale: u32,
-    upscale_device: u32,
-    upscale_best: bool,
-    upscale_devices: Vec<(u32, String)>,
-    upscale_rx: Option<mpsc::Receiver<UpscaleEv>>,
-    upscale_pid: std::sync::Arc<Mutex<Option<u32>>>,
-    upscale_status: String,
+    enh_open: bool,
+    enh_ask: bool,
+    enh_installing: bool,
+    enh_dead: bool,
+    enh_interp: bool,
+    enh_upscale: bool,
+    enh_up_recipe: UpRecipe,
+    enh_rife_recipe: RifeRecipe,
+    enh_scale: u32,
+    enh_device: u32,
+    enh_best: bool,
+    enh_devices: Vec<(u32, String)>,
+    enh_rx: Option<mpsc::Receiver<EnhEv>>,
+    enh_pid: std::sync::Arc<Mutex<Option<u32>>>,
+    enh_status: String,
+    /// Monotonic 0..1 progress for the current stage. Some passes report frame/total pairs
+    /// that aren't perfectly monotonic (chunked encodes, stray lines) — clamp to the max seen
+    /// so far instead of redrawing the raw ratio, or the bar visibly jumps backward.
+    enh_progress: f32,
+    enh_stages: Vec<Stage>,
+    enh_step: usize,
+    enh_started: Option<Instant>,
 }
 
 struct IntroShots {
@@ -465,8 +478,13 @@ struct CompareClip {
     tmp: bool,
 }
 
-enum UpscaleEv {
+enum EnhEv {
+    /// Worker has begun stage `usize` (index into `enh_stages`).
+    StageStart(usize),
+    /// Live progress text from the running pass (e.g. "frame=120/900)").
     Status(String),
+    /// A structured log line to append to the log window.
+    Log(String),
     Done(Result<PathBuf, String>),
 }
 
@@ -601,17 +619,25 @@ impl PlayerApp {
             wipe_drag: false,
             split: false,
             fps_pick: None,
-            upscale_open: false,
-            upscale_ask: false,
-            upscale_installing: false,
-            upscale_recipe: Recipe::AnimeFast,
-            upscale_scale: 4,
-            upscale_device: 0,
-            upscale_best: false,
-            upscale_devices: Vec::new(),
-            upscale_rx: None,
-            upscale_pid: std::sync::Arc::new(Mutex::new(None)),
-            upscale_status: String::new(),
+            enh_open: false,
+            enh_ask: false,
+            enh_installing: false,
+            enh_dead: true,
+            enh_interp: false,
+            enh_upscale: false,
+            enh_up_recipe: UpRecipe::AnimeFast,
+            enh_rife_recipe: RifeRecipe::Mid,
+            enh_scale: 4,
+            enh_device: 0,
+            enh_best: false,
+            enh_devices: Vec::new(),
+            enh_rx: None,
+            enh_pid: std::sync::Arc::new(Mutex::new(None)),
+            enh_status: String::new(),
+            enh_progress: 0.0,
+            enh_stages: Vec::new(),
+            enh_step: 0,
+            enh_started: None,
         };
         app.log(format!(
             "start v{APP_VERSION} {} {}",
@@ -1270,19 +1296,28 @@ impl PlayerApp {
         }
     }
 
-    fn open_upscale(&mut self) {
-        if self.decoder.is_none() || self.compare.is_some() || self.upscale_rx.is_some() {
+    /// Output filename the current checkbox state would produce, e.g. "clip - no dead frames.mp4".
+    fn enh_plan(&self) -> Vec<Stage> {
+        enhance::plan(self.enh_dead, self.enh_interp, self.enh_upscale)
+    }
+
+    fn enh_out_name(&self) -> Option<String> {
+        let d = self.decoder.as_ref()?;
+        let src = d.path();
+        let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+        Some(enhance::out_name(stem, ext, &self.enh_plan()))
+    }
+
+    fn open_enhance(&mut self) {
+        if self.decoder.is_none() || self.compare.is_some() || self.enh_rx.is_some() {
             return;
         }
-        if video2x::find_exe().is_none() {
-            self.upscale_ask = true;
-            return;
-        }
-        self.upscale_open = true;
-        self.upscale_status.clear();
+        self.enh_open = true;
+        self.enh_status.clear();
         if let Some(exe) = video2x::find_exe() {
-            self.upscale_devices = video2x::list_devices(&exe);
-            if let Some((id, _)) = self.upscale_devices.iter().max_by_key(|(id, name)| {
+            self.enh_devices = video2x::list_devices(&exe);
+            if let Some((id, _)) = self.enh_devices.iter().max_by_key(|(id, name)| {
                 let n = name.to_ascii_lowercase();
                 let score = if n.contains("nvidia") || n.contains("geforce") || n.contains("radeon")
                 {
@@ -1292,151 +1327,259 @@ impl PlayerApp {
                 };
                 score + *id
             }) {
-                self.upscale_device = *id;
+                self.enh_device = *id;
             }
         }
     }
 
-    fn estimate_upscale(&self) -> Option<(u64, f64, u32)> {
-        let d = self.decoder.as_ref()?;
-        let src = std::fs::metadata(d.path()).ok()?.len();
-        let scale = if self.upscale_recipe.is_rife() {
-            1
-        } else {
-            self.upscale_scale
-        };
-        let mult = if self.upscale_recipe.is_rife() { 2.0 } else { 1.0 };
-        let bytes = compare::estimate_bytes(src, scale, mult);
-        let secs = d.info.frame_count as f64 / d.info.fps.max(0.001);
-        Some((bytes, secs, scale))
+    /// Spawns a thread that forwards `String` progress lines as `EnhEv::Status`, so a worker
+    /// can hand a plain `Sender<String>` to a stage's own pump function.
+    fn bridge_status(tx: &mpsc::Sender<EnhEv>) -> (mpsc::Sender<String>, std::thread::JoinHandle<()>) {
+        let (ptx, prx) = mpsc::channel();
+        let tx2 = tx.clone();
+        let fwd = std::thread::spawn(move || {
+            while let Ok(s) = prx.recv() {
+                let _ = tx2.send(EnhEv::Status(s));
+            }
+        });
+        (ptx, fwd)
     }
 
-    fn start_upscale(&mut self) {
+    /// Runs the dead-frame ffmpeg pass and forwards its live "frame=n" progress as `EnhEv::Status`.
+    fn run_dead_stage(
+        tx: &mpsc::Sender<EnhEv>,
+        ffmpeg: &Path,
+        input: &Path,
+        dest: &Path,
+        total_frames: u64,
+    ) -> Result<(), String> {
+        let mut child = enhance::spawn_dead_frames(ffmpeg, input, dest)?;
+        let (ptx, fwd) = Self::bridge_status(tx);
+        let tail = enhance::pump_dead_progress(&mut child, total_frames.max(1), &ptx);
+        drop(ptx);
+        let _ = fwd.join();
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if ok && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            Ok(())
+        } else if tail.is_empty() {
+            Err("dead-frame cut failed".into())
+        } else {
+            Err(tail)
+        }
+    }
+
+    /// Runs a single Video2X pass and forwards its live "frame=a/b" progress as `EnhEv::Status`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_v2x_stage(
+        tx: &mpsc::Sender<EnhEv>,
+        pid_slot: &std::sync::Arc<Mutex<Option<u32>>>,
+        exe: &Path,
+        input: &Path,
+        dest: &Path,
+        processor: &str,
+        model: &str,
+        is_rife: bool,
+        scale: u32,
+        device: u32,
+        best: bool,
+    ) -> Result<(), String> {
+        let mut child = video2x::spawn(exe, input, dest, processor, model, is_rife, scale, device, best)?;
+        *pid_slot.lock().unwrap() = Some(child.id());
+        let (ptx, fwd) = Self::bridge_status(tx);
+        let tail = video2x::pump_progress(&mut child, &ptx);
+        drop(ptx);
+        let _ = fwd.join();
+        let _ = child.wait();
+        *pid_slot.lock().unwrap() = None;
+        // Video2X can exit non-zero after a good write (no console / stdin).
+        if video2x::output_ready(dest) {
+            Ok(())
+        } else if tail.is_empty() {
+            Err("Video2X failed".into())
+        } else {
+            Err(format!("Video2X failed: {tail}"))
+        }
+    }
+
+    fn start_enhance(&mut self) {
         let Some(d) = &self.decoder else {
             return;
         };
-        if self.upscale_rx.is_some() {
+        if self.enh_rx.is_some() {
             return;
         }
-        if video2x::find_exe().is_none() {
-            self.upscale_open = false;
-            self.upscale_ask = true;
+        let stages = self.enh_plan();
+        if stages.is_empty() {
             return;
         }
+        let needs_v2x = stages.iter().any(|s| *s != Stage::Dead);
+        if needs_v2x && video2x::find_exe().is_none() {
+            self.enh_open = false;
+            self.enh_ask = true;
+            return;
+        }
+        let Ok(ffmpeg) = self.ffmpeg.clone() else {
+            return;
+        };
+        let Some(out_name) = self.enh_out_name() else {
+            return;
+        };
         let input = d.path().to_path_buf();
-        let dest = bundle::data_dir().join(format!(
-            "up-{}.mp4",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ));
-        let recipe = self.upscale_recipe;
-        let scale = self.upscale_scale;
-        let device = self.upscale_device;
-        let best = self.upscale_best;
+        let up_recipe = self.enh_up_recipe;
+        let rife_recipe = self.enh_rife_recipe;
+        let scale = self.enh_scale;
+        let device = self.enh_device;
+        let best = self.enh_best;
         let (tx, rx) = mpsc::channel();
-        self.upscale_rx = Some(rx);
-        self.upscale_open = false;
-        self.upscale_status = "Video2X…".into();
+        self.enh_rx = Some(rx);
+        self.enh_stages = stages.clone();
+        self.enh_step = 0;
+        self.enh_status.clear();
+        self.enh_started = Some(Instant::now());
         self.log(format!(
-            "v2x {} {} d={device}",
-            recipe.processor(),
-            recipe.model()
+            "enh plan {} out=\"{out_name}\"",
+            stages.iter().map(|s| s.tag()).collect::<Vec<_>>().join("+")
         ));
-        let pid_slot = self.upscale_pid.clone();
+        let pid_slot = self.enh_pid.clone();
         std::thread::spawn(move || {
-            let Some(exe) = video2x::find_exe() else {
-                let _ = tx.send(UpscaleEv::Done(Err("Video2X missing".into())));
-                return;
-            };
-            let _ = tx.send(UpscaleEv::Status("Video2X running…".into()));
-            match video2x::spawn(&exe, &input, &dest, recipe, scale, device, best) {
-                Ok(mut child) => {
-                    *pid_slot.lock().unwrap() = Some(child.id());
-                    let tail = video2x::pump_progress(&mut child, &{
-                        let tx = tx.clone();
-                        let (ptx, prx) = mpsc::channel();
-                        std::thread::spawn(move || {
-                            while let Ok(s) = prx.recv() {
-                                let _ = tx.send(UpscaleEv::Status(s));
-                            }
-                        });
-                        ptx
-                    });
-                    let _ = child.wait();
-                    *pid_slot.lock().unwrap() = None;
-                    // Video2X can exit non-zero after a good write (no console / stdin).
-                    if video2x::output_ready(&dest) {
-                        let _ = tx.send(UpscaleEv::Done(Ok(dest)));
-                    } else {
-                        let msg = if tail.is_empty() {
-                            "Video2X failed".into()
-                        } else {
-                            format!("Video2X failed: {tail}")
+            let mut cur = input.clone();
+            let mut made: Vec<PathBuf> = Vec::new();
+            let mut final_err: Option<String> = None;
+            for (i, stage) in stages.iter().enumerate() {
+                let _ = tx.send(EnhEv::StageStart(i));
+                let dest = bundle::data_dir().join(format!("enh-{}-{i}.mp4", std::process::id()));
+                let t0 = Instant::now();
+                let before_frames = decoder::probe(&ffmpeg, &cur).ok().map(|inf| inf.frame_count);
+                let res = match stage {
+                    Stage::Dead => Self::run_dead_stage(
+                        &tx, &ffmpeg, &cur, &dest, before_frames.unwrap_or(0),
+                    ),
+                    Stage::Interp => match video2x::find_exe() {
+                        Some(exe) => Self::run_v2x_stage(
+                            &tx, &pid_slot, &exe, &cur, &dest,
+                            compare::RifeRecipe::processor(), rife_recipe.model(), true, 1, device, best,
+                        ),
+                        None => Err("Video2X missing".into()),
+                    },
+                    Stage::Upscale => match video2x::find_exe() {
+                        Some(exe) => Self::run_v2x_stage(
+                            &tx, &pid_slot, &exe, &cur, &dest,
+                            compare::UpRecipe::processor(), up_recipe.model(), false, scale, device, best,
+                        ),
+                        None => Err("Video2X missing".into()),
+                    },
+                };
+                match res {
+                    Ok(()) => {
+                        let elapsed = t0.elapsed().as_secs_f32();
+                        let after_frames = decoder::probe(&ffmpeg, &dest).ok().map(|inf| inf.frame_count);
+                        let delta = match (before_frames, after_frames) {
+                            (Some(b), Some(a)) => format!(" {b}f -> {a}f"),
+                            _ => String::new(),
                         };
-                        let _ = tx.send(UpscaleEv::Done(Err(msg)));
+                        let _ = tx.send(EnhEv::Log(format!(
+                            "enh {}/{} {} ok {elapsed:.1}s{delta}",
+                            i + 1,
+                            stages.len(),
+                            stage.tag()
+                        )));
+                        if cur != input {
+                            made.push(cur.clone());
+                        }
+                        cur = dest;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(EnhEv::Log(format!(
+                            "enh {}/{} {} fail {e}",
+                            i + 1,
+                            stages.len(),
+                            stage.tag()
+                        )));
+                        final_err = Some(e);
+                        break;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.send(UpscaleEv::Done(Err(e)));
+            }
+            for f in &made {
+                let _ = std::fs::remove_file(f);
+            }
+            match final_err {
+                Some(e) => {
+                    if cur != input {
+                        let _ = std::fs::remove_file(&cur);
+                    }
+                    let _ = tx.send(EnhEv::Done(Err(e)));
+                }
+                None => {
+                    let _ = tx.send(EnhEv::Done(Ok(cur)));
                 }
             }
         });
     }
 
     fn start_v2x_install(&mut self) {
-        if self.upscale_rx.is_some() || video2x::find_exe().is_some() {
-            self.upscale_ask = false;
+        if self.enh_rx.is_some() || video2x::find_exe().is_some() {
+            self.enh_ask = false;
             if video2x::find_exe().is_some() {
-                self.open_upscale();
+                self.open_enhance();
             }
             return;
         }
         let (tx, rx) = mpsc::channel();
-        self.upscale_rx = Some(rx);
-        self.upscale_ask = false;
-        self.upscale_installing = true;
-        self.upscale_status = "Video2X…".into();
+        self.enh_rx = Some(rx);
+        self.enh_ask = false;
+        self.enh_installing = true;
+        self.enh_status = "Video2X…".into();
         self.status = self
             .lang()
             .tr("Video2X indiriliyor…", "Downloading Video2X…")
             .into();
+        self.log("enh v2x install start");
         std::thread::spawn(move || {
             let (itx, irx) = mpsc::channel();
             let tx_i = tx.clone();
             std::thread::spawn(move || {
                 while let Ok(s) = irx.recv() {
-                    let _ = tx_i.send(UpscaleEv::Status(s));
+                    let _ = tx_i.send(EnhEv::Status(s));
                 }
             });
             match video2x::install(&itx) {
                 Ok(p) => {
-                    let _ = tx.send(UpscaleEv::Done(Ok(p)));
+                    let _ = tx.send(EnhEv::Log("enh v2x install ok".into()));
+                    let _ = tx.send(EnhEv::Done(Ok(p)));
                 }
                 Err(e) => {
-                    let _ = tx.send(UpscaleEv::Done(Err(e)));
+                    let _ = tx.send(EnhEv::Log(format!("enh v2x install fail {e}")));
+                    let _ = tx.send(EnhEv::Done(Err(e)));
                 }
             }
         });
     }
 
-    fn cancel_upscale(&mut self) {
-        if let Some(pid) = self.upscale_pid.lock().unwrap().take() {
+    fn cancel_enhance(&mut self) {
+        if let Some(pid) = self.enh_pid.lock().unwrap().take() {
             let _ = Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/F", "/T"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status();
         }
-        self.upscale_rx = None;
-        self.upscale_installing = false;
-        self.upscale_status.clear();
-        self.status = self.lang().tr("Upscale iptal", "Upscale cancelled").into();
+        self.log(format!(
+            "enh cancelled at {}/{}",
+            self.enh_step + 1,
+            self.enh_stages.len().max(1)
+        ));
+        self.enh_rx = None;
+        self.enh_installing = false;
+        self.enh_status.clear();
+        self.status = self
+            .lang()
+            .tr("Enhancements iptal", "Enhancements cancelled")
+            .into();
     }
 
-    fn poll_upscale(&mut self, ctx: &egui::Context) {
+    fn poll_enhance(&mut self, ctx: &egui::Context) {
         loop {
-            let ev = match self.upscale_rx.as_ref().map(|rx| rx.try_recv()) {
+            let ev = match self.enh_rx.as_ref().map(|rx| rx.try_recv()) {
                 None => return,
                 Some(Ok(v)) => v,
                 Some(Err(mpsc::TryRecvError::Empty)) => {
@@ -1444,39 +1587,54 @@ impl PlayerApp {
                     return;
                 }
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                    self.upscale_rx = None;
+                    self.enh_rx = None;
                     return;
                 }
             };
             match ev {
-                UpscaleEv::Status(s) => {
-                    if crate::compare::parse_progress(&s).is_none() && !s.contains("frame=") {
-                        self.log(s.clone());
+                EnhEv::StageStart(i) => {
+                    self.enh_step = i;
+                    self.enh_status.clear();
+                    self.enh_progress = 0.0;
+                    ctx.request_repaint();
+                }
+                EnhEv::Status(s) => {
+                    if let Some((cur, total)) = compare::parse_progress(&s) {
+                        let frac = if total > 0 { cur as f32 / total as f32 } else { 0.0 };
+                        self.enh_progress = self.enh_progress.max(frac.clamp(0.0, 1.0));
                     }
-                    self.upscale_status = s.clone();
+                    self.enh_status = s.clone();
                     self.status = s;
                     ctx.request_repaint();
                 }
-                UpscaleEv::Done(v) => {
-                    let installing = self.upscale_installing;
-                    self.upscale_installing = false;
-                    self.upscale_rx = None;
-                    *self.upscale_pid.lock().unwrap() = None;
+                EnhEv::Log(s) => {
+                    self.log(s);
+                }
+                EnhEv::Done(v) => {
+                    let installing = self.enh_installing;
+                    self.enh_installing = false;
+                    self.enh_rx = None;
+                    *self.enh_pid.lock().unwrap() = None;
                     match v {
                         Ok(_) if installing => {
                             self.status = self.lang().tr("Video2X hazır", "Video2X ready").into();
-                            self.open_upscale();
+                            self.open_enhance();
                         }
                         Ok(path) => {
+                            let elapsed = self
+                                .enh_started
+                                .map(|t| t.elapsed().as_secs_f32())
+                                .unwrap_or(0.0);
+                            self.log(format!("enh done {elapsed:.1}s"));
                             self.status = self
                                 .lang()
                                 .tr("Karşılaştırma hazır", "Compare ready")
                                 .into();
+                            self.enh_open = false;
                             self.offer_compare(path, true, ctx);
                         }
                         Err(e) => {
-                            self.log(e.clone());
-                            self.status = e.lines().next().unwrap_or("Video2X failed").into();
+                            self.status = e.lines().next().unwrap_or("Enhancements failed").into();
                         }
                     }
                     return;
@@ -1526,8 +1684,8 @@ impl PlayerApp {
             });
     }
 
-    fn show_upscale_ask(&mut self, ctx: &egui::Context) {
-        if !self.upscale_ask {
+    fn show_enh_ask(&mut self, ctx: &egui::Context) {
+        if !self.enh_ask {
             return;
         }
         let lang = self.lang();
@@ -1556,86 +1714,220 @@ impl PlayerApp {
             self.start_v2x_install();
         }
         if no {
-            self.upscale_ask = false;
+            self.enh_ask = false;
         }
     }
 
-    fn show_upscale(&mut self, ctx: &egui::Context) {
-        if !self.upscale_open {
+    /// Chip label for the pipeline strip, e.g. "① Cut dead frames".
+    fn enh_stage_label(lang: Lang, s: Stage) -> &'static str {
+        match s {
+            Stage::Dead => lang.tr("Ölü kare at", "Cut dead frames"),
+            Stage::Interp => lang.tr("Ara kare üret", "Interpolate"),
+            Stage::Upscale => lang.tr("Büyüt", "Upscale"),
+        }
+    }
+
+    fn show_enhance(&mut self, ctx: &egui::Context) {
+        if !self.enh_open {
             return;
         }
         let lang = self.lang();
-        let est = self.estimate_upscale();
+        let running = self.enh_rx.is_some();
+        let stages = if running {
+            self.enh_stages.clone()
+        } else {
+            self.enh_plan()
+        };
+        let out_name = self.enh_out_name();
+        let info = self.decoder.as_ref().map(|d| {
+            format!(
+                "{}×{}  ·  {:.2} fps  ·  {} {}",
+                d.info.width,
+                d.info.height,
+                d.info.fps,
+                d.info.frame_count,
+                lang.tr("kare", "frames")
+            )
+        });
         let mut start = false;
         let mut close = false;
-        egui::Window::new(lang.tr("Yükselt", "Upscale"))
+        let mut cancel = false;
+        egui::Window::new(lang.tr("Geliştirmeler", "Enhancements"))
             .collapsible(false)
             .resizable(false)
+            .default_width(560.0)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(lang.tr("Anime", "Anime"));
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.upscale_recipe, Recipe::AnimeFast, lang.tr("Orta, hızlı", "Medium, fast"));
-                    ui.radio_value(&mut self.upscale_recipe, Recipe::AnimeSlow, lang.tr("İyi, yavaş", "Good, slow"));
-                });
-                ui.label(lang.tr("Genel", "General"));
-                ui.radio_value(&mut self.upscale_recipe, Recipe::General, lang.tr("En iyi", "Best"));
-                ui.label(lang.tr("Akışkanlık (FPS)", "Smoothness (FPS)"));
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeLite, lang.tr("İyi, hızlı", "Good, fast"));
-                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeMid, lang.tr("İyi, orta", "Good, medium"));
-                    ui.radio_value(&mut self.upscale_recipe, Recipe::RifeBest, lang.tr("En iyi, kararsız", "Best, unstable"));
-                });
-                if !self.upscale_recipe.is_rife() {
-                    ui.horizontal(|ui| {
-                        ui.label(lang.tr("Ölçek", "Scale"));
-                        ui.radio_value(&mut self.upscale_scale, 2, "2×");
-                        ui.radio_value(&mut self.upscale_scale, 4, "4×");
-                    });
+                if let Some(info) = &info {
+                    ui.weak(info);
+                    ui.add_space(4.0);
                 }
-                if !self.upscale_devices.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label("GPU");
-                        egui::ComboBox::from_id_salt("v2x_gpu")
-                            .selected_text(
-                                self.upscale_devices
-                                    .iter()
-                                    .find(|(id, _)| *id == self.upscale_device)
-                                    .map(|(_, n)| n.as_str())
-                                    .unwrap_or("GPU"),
-                            )
-                            .show_ui(ui, |ui| {
-                                for (id, name) in &self.upscale_devices {
-                                    ui.selectable_value(&mut self.upscale_device, *id, name);
-                                }
-                            });
-                    });
-                }
-                ui.radio_value(&mut self.upscale_best, false, "Output for Optimal Quality (Recommended)");
-                ui.radio_value(&mut self.upscale_best, true, "Output for Best Quality");
-                if let Some((bytes, secs, scale)) = est {
-                    ui.weak(format!(
-                        "{}  ·  {:.0}s  ·  {}×",
-                        fmt_bytes(bytes),
-                        secs,
-                        scale
-                    ));
-                }
-                ui.add_space(8.0);
+                // Pipeline strip: the fixed run order, doubling as a live progress readout.
                 ui.horizontal(|ui| {
-                    if ui.button(lang.tr("Başla", "Start")).clicked() {
-                        start = true;
+                    for (i, s) in [Stage::Dead, Stage::Interp, Stage::Upscale].iter().enumerate() {
+                        let idx = stages.iter().position(|x| x == s);
+                        let mark = if running {
+                            match idx {
+                                Some(p) if p < self.enh_step => "[x] ",
+                                Some(p) if p == self.enh_step => "[>] ",
+                                Some(_) => "[ ] ",
+                                None => "",
+                            }
+                        } else if idx.is_some() {
+                            "[x] "
+                        } else {
+                            "[ ] "
+                        };
+                        let text = format!("{mark}{}", Self::enh_stage_label(lang, *s));
+                        if idx.is_some() {
+                            ui.strong(text);
+                        } else {
+                            ui.weak(text);
+                        }
+                        if i < 2 {
+                            ui.weak("->");
+                        }
                     }
+                });
+                ui.separator();
+
+                if running {
+                    let step_no = self.enh_step + 1;
+                    let step_label = stages
+                        .get(self.enh_step)
+                        .map(|s| Self::enh_stage_label(lang, *s))
+                        .unwrap_or_default();
+                    ui.label(format!(
+                        "{} {step_no}/{} · {step_label}",
+                        lang.tr("Adım", "Step"),
+                        stages.len().max(1)
+                    ));
+                    // Bar tracks enh_progress (monotonic max), not the raw last message — some
+                    // passes report frame/total pairs that dip mid-stage (chunked encodes).
+                    let bar_text = if let Some((cur, total)) = compare::parse_progress(&self.enh_status) {
+                        format!("{cur}/{total}")
+                    } else if self.enh_progress > 0.0 {
+                        format!("{:.0}%", self.enh_progress * 100.0)
+                    } else if self.enh_status.is_empty() {
+                        lang.tr("Hazırlanıyor…", "Preparing…").to_string()
+                    } else {
+                        self.enh_status.clone()
+                    };
+                    ui.add(egui::ProgressBar::new(self.enh_progress).text(bar_text));
+                    if let Some(t0) = self.enh_started {
+                        ui.weak(format!("{:.0}s", t0.elapsed().as_secs_f32()));
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(lang.tr("İptal", "Cancel")).clicked() {
+                        cancel = true;
+                    }
+                    return;
+                }
+
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.enh_dead, Self::enh_stage_label(lang, Stage::Dead));
+                if self.enh_dead {
+                    ui.indent("enh_dead_body", |ui| {
+                        ui.weak(lang.tr(
+                            "Bir öncekiyle birebir aynı kareleri siler (sabit sahneler). Ses düşer.",
+                            "Drops frames pixel-identical to the previous one (static scenes). Audio is dropped.",
+                        ));
+                    });
+                }
+
+                ui.checkbox(&mut self.enh_interp, Self::enh_stage_label(lang, Stage::Interp));
+                if self.enh_interp {
+                    ui.indent("enh_interp_body", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.enh_rife_recipe, RifeRecipe::Lite, lang.tr("İyi, hızlı", "Good, fast"));
+                            ui.radio_value(&mut self.enh_rife_recipe, RifeRecipe::Mid, lang.tr("İyi, orta", "Good, medium"));
+                            ui.radio_value(&mut self.enh_rife_recipe, RifeRecipe::Best, lang.tr("En iyi, kararsız", "Best, unstable"));
+                        });
+                        if let Some(d) = &self.decoder {
+                            ui.weak(format!("{:.0} -> {:.0} fps", d.info.fps, d.info.fps * 2.0));
+                        }
+                    });
+                }
+
+                ui.checkbox(&mut self.enh_upscale, Self::enh_stage_label(lang, Stage::Upscale));
+                if self.enh_upscale {
+                    ui.indent("enh_upscale_body", |ui| {
+                        ui.label(lang.tr("Anime", "Anime"));
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.enh_up_recipe, UpRecipe::AnimeFast, lang.tr("Orta, hızlı", "Medium, fast"));
+                            ui.radio_value(&mut self.enh_up_recipe, UpRecipe::AnimeSlow, lang.tr("İyi, yavaş", "Good, slow"));
+                        });
+                        ui.label(lang.tr("Genel", "General"));
+                        ui.radio_value(&mut self.enh_up_recipe, UpRecipe::General, lang.tr("En iyi", "Best"));
+                        ui.horizontal(|ui| {
+                            ui.label(lang.tr("Ölçek", "Scale"));
+                            ui.radio_value(&mut self.enh_scale, 2, "2×");
+                            ui.radio_value(&mut self.enh_scale, 4, "4×");
+                        });
+                        if let Some(d) = &self.decoder {
+                            ui.weak(format!(
+                                "{}x{} -> {}x{}",
+                                d.info.width,
+                                d.info.height,
+                                d.info.width * self.enh_scale,
+                                d.info.height * self.enh_scale
+                            ));
+                        }
+                    });
+                }
+
+                if self.enh_interp || self.enh_upscale {
+                    ui.add_space(4.0);
+                    if !self.enh_devices.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("GPU");
+                            egui::ComboBox::from_id_salt("v2x_gpu")
+                                .selected_text(
+                                    self.enh_devices
+                                        .iter()
+                                        .find(|(id, _)| *id == self.enh_device)
+                                        .map(|(_, n)| n.as_str())
+                                        .unwrap_or("GPU"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (id, name) in &self.enh_devices {
+                                        ui.selectable_value(&mut self.enh_device, *id, name);
+                                    }
+                                });
+                        });
+                    }
+                    ui.radio_value(&mut self.enh_best, false, "Output for Optimal Quality (Recommended)");
+                    ui.radio_value(&mut self.enh_best, true, "Output for Best Quality");
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(lang.tr("Çıktı", "Output"));
+                    ui.weak(out_name.as_deref().unwrap_or("—"));
+                });
+                ui.add_space(8.0);
+                let n = stages.len();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(n > 0, |ui| {
+                        let label = format!("{} ({n} {})", lang.tr("Başla", "Start"), lang.tr("adım", "step"));
+                        if ui.button(label).clicked() {
+                            start = true;
+                        }
+                    });
                     if ui.button(lang.tr("Kapat", "Close")).clicked() {
                         close = true;
                     }
                 });
             });
         if start {
-            self.start_upscale();
+            self.start_enhance();
         }
         if close {
-            self.upscale_open = false;
+            self.enh_open = false;
+        }
+        if cancel {
+            self.cancel_enhance();
         }
     }
 
@@ -2499,13 +2791,13 @@ impl eframe::App for PlayerApp {
         self.poll_export(ctx);
         self.poll_update(ctx);
         self.poll_update_state(ctx);
-        self.poll_upscale(ctx);
+        self.poll_enhance(ctx);
         self.show_about(ctx);
         self.show_logs(ctx);
         self.show_update_modal(ctx);
         self.show_format_modal(ctx);
-        self.show_upscale_ask(ctx);
-        self.show_upscale(ctx);
+        self.show_enh_ask(ctx);
+        self.show_enhance(ctx);
         self.show_fps_pick(ctx);
         if self.intro.is_none() && self.tour.is_none() {
             if let Some(p) = self.pending_open.take() {
@@ -2683,24 +2975,30 @@ impl eframe::App for PlayerApp {
                         self.start_url();
                     }
                 });
-                if self.decoder.is_some() && self.compare.is_none() && self.tour.is_none() {
-                    if ui
-                        .button(lang.tr("Yükselt", "Upscale"))
-                        .on_hover_text(lang.tr(
-                            "Video2X ile yükselt, B olarak aç",
-                            "Upscale with Video2X, open as B",
-                        ))
-                        .clicked()
-                    {
-                        self.open_upscale();
-                    }
-                    if ui
-                        .button(lang.tr("Karşılaştır", "Compare"))
-                        .on_hover_text(lang.tr("İkinci video (B)", "Second video (B)"))
-                        .clicked()
-                    {
-                        self.pick_compare(&ctx);
-                    }
+                if self.decoder.is_some() && self.tour.is_none() {
+                    ui.add_enabled_ui(self.compare.is_none(), |ui| {
+                        if ui
+                            .button(lang.tr("Geliştirmeler", "Enhancements"))
+                            .on_hover_text(if self.compare.is_some() {
+                                lang.tr("Önce B'yi kapat", "Close B first")
+                            } else {
+                                lang.tr(
+                                    "Ölü kare at, ara kare üret, büyüt — B olarak aç",
+                                    "Cut dead frames, interpolate, upscale — open as B",
+                                )
+                            })
+                            .clicked()
+                        {
+                            self.open_enhance();
+                        }
+                        if ui
+                            .button(lang.tr("Karşılaştır", "Compare"))
+                            .on_hover_text(lang.tr("İkinci video (B)", "Second video (B)"))
+                            .clicked()
+                        {
+                            self.pick_compare(&ctx);
+                        }
+                    });
                 }
                 if self.compare.is_some() {
                     let split_lbl = if self.split {
@@ -2734,9 +3032,9 @@ impl eframe::App for PlayerApp {
                         self.close_compare();
                     }
                 }
-                if self.upscale_rx.is_some() {
+                if self.enh_rx.is_some() {
                     if ui.button(lang.tr("İptal", "Cancel")).clicked() {
-                        self.cancel_upscale();
+                        self.cancel_enhance();
                     }
                 }
                 ui.separator();

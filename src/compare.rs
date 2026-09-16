@@ -66,22 +66,17 @@ pub fn estimate_bytes(src_len: u64, scale: u32, frame_mult: f64) -> u64 {
     ((src_len as f64 * area as f64 * m) * 1.2) as u64
 }
 
+/// Upscale (RealESRGAN) recipe. Independent from interpolation so both can run in one chain.
 #[derive(Clone, Copy, PartialEq)]
-pub enum Recipe {
+pub enum UpRecipe {
     AnimeFast,
     AnimeSlow,
     General,
-    RifeLite,
-    RifeMid,
-    RifeBest,
 }
 
-impl Recipe {
-    pub fn processor(self) -> &'static str {
-        match self {
-            Self::RifeLite | Self::RifeMid | Self::RifeBest => "rife",
-            _ => "realesrgan",
-        }
+impl UpRecipe {
+    pub const fn processor() -> &'static str {
+        "realesrgan"
     }
 
     pub fn model(self) -> &'static str {
@@ -89,13 +84,28 @@ impl Recipe {
             Self::AnimeFast => "realesr-animevideov3",
             Self::AnimeSlow => "realesrgan-plus-anime",
             Self::General => "realesrgan-plus",
-            Self::RifeLite => "rife-v4.25-lite",
-            Self::RifeMid => "rife-v4.25",
-            Self::RifeBest => "rife-v4.26",
         }
     }
+}
 
-    pub fn is_rife(self) -> bool {
-        matches!(self, Self::RifeLite | Self::RifeMid | Self::RifeBest)
+/// Frame-interpolation (RIFE) recipe. Independent from upscale so both can run in one chain.
+#[derive(Clone, Copy, PartialEq)]
+pub enum RifeRecipe {
+    Lite,
+    Mid,
+    Best,
+}
+
+impl RifeRecipe {
+    pub const fn processor() -> &'static str {
+        "rife"
+    }
+
+    pub fn model(self) -> &'static str {
+        match self {
+            Self::Lite => "rife-v4.25-lite",
+            Self::Mid => "rife-v4.25",
+            Self::Best => "rife-v4.26",
+        }
     }
 }
