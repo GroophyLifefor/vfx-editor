@@ -650,11 +650,15 @@ impl PlayerApp {
                 app.update_modal = Some(UpdateModal::Done);
             }
             app.spawn_update_check();
+            let play = app.pending_open.is_some();
             if let Some(p) = app.pending_open.take() {
                 app.open_path(p, &cc.egui_ctx);
             }
             if let Some(p) = app.pending_compare.take() {
                 app.offer_compare(p, false, &cc.egui_ctx);
+            }
+            if play && app.decoder.is_some() {
+                app.toggle_play(&cc.egui_ctx);
             }
         }
         app
@@ -2800,11 +2804,15 @@ impl eframe::App for PlayerApp {
         self.show_enhance(ctx);
         self.show_fps_pick(ctx);
         if self.intro.is_none() && self.tour.is_none() {
+            let play = self.pending_open.is_some();
             if let Some(p) = self.pending_open.take() {
                 self.open_path(p, ctx);
             }
             if let Some(p) = self.pending_compare.take() {
                 self.offer_compare(p, false, ctx);
+            }
+            if play && self.decoder.is_some() && !self.playing {
+                self.toggle_play(ctx);
             }
         }
         self.tick_intro(ctx);

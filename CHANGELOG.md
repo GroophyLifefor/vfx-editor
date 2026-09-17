@@ -2,6 +2,10 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.10
+
+- Start playback when launched by dropping a video on the exe
+
 ## 0.1.9
 
 - Upscale replaced by Enhancements: cut dead frames, interpolate and upscale, chainable in one run
