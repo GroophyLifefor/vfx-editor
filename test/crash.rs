@@ -9,7 +9,9 @@ fn crash_sits_next_to_lang() {
 #[test]
 fn crash_text_has_panic_then_dump() {
     let s = format_crash("panic: boom", "VFX Player v0.1.5\n[    0.00] start");
-    assert!(s.starts_with("panic: boom"));
+    assert!(s.starts_with("VFX Player"));
+    assert!(s.contains("crash"));
+    assert!(s.contains("panic: boom"));
     assert!(s.contains("---"));
     assert!(s.contains("VFX Player"));
 }

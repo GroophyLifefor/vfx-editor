@@ -106,8 +106,18 @@ fn remember_log(dump: String) {
     *LAST_LOG.lock().unwrap_or_else(|e| e.into_inner()) = dump;
 }
 
+fn session_log_path() -> PathBuf {
+    bundle::data_dir().join("session.log")
+}
+
+/// Mirror the in-app log to disk so it survives a close and can be attached to a report.
+fn persist_log(dump: &str) {
+    let _ = std::fs::create_dir_all(bundle::data_dir());
+    let _ = std::fs::write(session_log_path(), dump);
+}
+
 fn format_crash(info: &str, dump: &str) -> String {
-    format!("{info}\n---\n{dump}")
+    format!("VFX Player v{APP_VERSION} crash\n{info}\n---\n{dump}")
 }
 
 fn write_crash(info: &str) {
@@ -402,8 +412,9 @@ struct PlayerApp {
     update_modal: Option<UpdateModal>,
     about_open: bool,
     log_open: bool,
+    log_filter: LogLevel,
     started: Instant,
-    logs: Vec<String>,
+    logs: Vec<LogLine>,
     volume: f32,
     dark: bool,
     pending_open: Option<PathBuf>,
@@ -570,6 +581,40 @@ enum RangeDrag {
     Out,
 }
 
+/// Severity of a log line. Drives both the on-screen colour and the filter buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Info => "INF",
+            Self::Warn => "WRN",
+            Self::Error => "ERR",
+        }
+    }
+
+    fn color(self, dark: bool) -> Color32 {
+        match (self, dark) {
+            (Self::Info, true) => Color32::from_rgb(190, 198, 208),
+            (Self::Info, false) => Color32::from_rgb(60, 68, 78),
+            (Self::Warn, true) => Color32::from_rgb(224, 178, 80),
+            (Self::Warn, false) => Color32::from_rgb(150, 100, 0),
+            (Self::Error, true) => Color32::from_rgb(232, 108, 92),
+            (Self::Error, false) => Color32::from_rgb(170, 40, 30),
+        }
+    }
+}
+
+struct LogLine {
+    level: LogLevel,
+    text: String,
+}
+
 impl PlayerApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
@@ -645,6 +690,7 @@ impl PlayerApp {
             update_modal: None,
             about_open: false,
             log_open: false,
+            log_filter: LogLevel::Info,
             started: Instant::now(),
             logs: Vec::new(),
             volume: load_volume(),
@@ -697,9 +743,17 @@ impl PlayerApp {
             enh_started: None,
         };
         app.log(format!(
-            "start v{APP_VERSION} {} {}",
+            "start v{APP_VERSION} {} {} pid={} exe={}",
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            std::process::id(),
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "-".into())
+        ));
+        app.log(format!(
+            "data dir {}",
+            bundle::data_dir().display()
         ));
         if app.intro.is_none() && app.tour.is_none() {
             let marked = take_just_updated();
@@ -726,12 +780,29 @@ impl PlayerApp {
     }
 
     fn log(&mut self, msg: impl Into<String>) {
+        self.log_lvl(LogLevel::Info, msg);
+    }
+
+    fn log_warn(&mut self, msg: impl Into<String>) {
+        self.log_lvl(LogLevel::Warn, msg);
+    }
+
+    fn log_err(&mut self, msg: impl Into<String>) {
+        self.log_lvl(LogLevel::Error, msg);
+    }
+
+    fn log_lvl(&mut self, level: LogLevel, msg: impl Into<String>) {
         let t = self.started.elapsed().as_secs_f32();
-        self.logs.push(format!("[{t:8.2}] {}", msg.into()));
+        self.logs.push(LogLine {
+            level,
+            text: format!("[{t:8.2}] {} {}", level.tag(), msg.into()),
+        });
         if self.logs.len() > 400 {
             self.logs.drain(0..self.logs.len() - 300);
         }
-        remember_log(self.log_dump());
+        let dump = self.log_dump();
+        remember_log(dump.clone());
+        persist_log(&dump);
     }
 
     fn set_lang(&mut self, lang: Lang) {
@@ -1157,7 +1228,7 @@ impl PlayerApp {
             Ok(p) => p.clone(),
             Err(e) => {
                 self.status = e.clone();
-                self.log(format!("ffmpeg: {e}"));
+                self.log_err(format!("ffmpeg: {e}"));
                 return;
             }
         };
@@ -1182,7 +1253,7 @@ impl PlayerApp {
                 self.decoder = None;
                 self.audio = None;
                 self.texture = None;
-                self.log(format!("open fail {e}"));
+                self.log_err(format!("open fail {e}"));
                 self.status = e;
             }
         }
@@ -1289,7 +1360,7 @@ impl PlayerApp {
                 self.wipe = 0.5;
             }
             Err(e) => {
-                self.log(format!("compare fail {e}"));
+                self.log_err(format!("compare fail {e}"));
                 self.status = e;
             }
         }
@@ -1347,9 +1418,12 @@ impl PlayerApp {
         match std::fs::copy(&src, &dest) {
             Ok(_) => {
                 self.status = dest.display().to_string();
-                self.log(format!("saved {}", dest.display()));
+                self.log(format!("saved copy {}", dest.display()));
             }
-            Err(e) => self.status = format!("save: {e}"),
+            Err(e) => {
+                self.log_err(format!("save copy fail {e}"));
+                self.status = format!("save: {e}");
+            }
         }
     }
 
@@ -1367,7 +1441,10 @@ impl PlayerApp {
                     self.status = dest.display().to_string();
                     self.log(format!("compare saved {}", dest.display()));
                 }
-                Err(e) => self.status = format!("save: {e}"),
+                Err(e) => {
+                    self.log_err(format!("compare save fail {e}"));
+                    self.status = format!("save: {e}");
+                }
             }
         }
     }
@@ -2049,6 +2126,7 @@ impl PlayerApp {
         }
         let lang = self.lang();
         if !url_allowed(&url) {
+            self.log_warn(format!("url rejected {url}"));
             self.status = lang
                 .tr(
                     "Desteklenen: YouTube, Shorts, Instagram, TikTok, Facebook, X, Reddit",
@@ -2057,6 +2135,7 @@ impl PlayerApp {
                 .into();
             return;
         }
+        self.log(format!("url extract {url}"));
         self.format_pick = None;
         self.status = lang.tr("Çıkarılıyor…", "Extracting…").into();
         let (tx, rx) = mpsc::channel();
@@ -2081,6 +2160,7 @@ impl PlayerApp {
         let ffmpeg = self.ffmpeg.clone().ok();
         self.format_pick = None;
         self.status = lang.tr("İndiriliyor…", "Downloading…").into();
+        self.log(format!("url download {url} spec={spec} merge={merge}"));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = download_ytdlp(&url, lang, ffmpeg.as_deref(), &spec, merge, &tx);
@@ -2446,10 +2526,13 @@ impl PlayerApp {
                 d.current, d.info.frame_count, d.info.fps, self.playback_fps, self.ended
             )
         });
+        let audio = self.audio.as_ref().map(|_| "some").unwrap_or("none");
+        let cmp = self.compare.as_ref().map(|_| "yes").unwrap_or("no");
         let mut s = format!(
             "VFX Player v{APP_VERSION}\n\
              os={} arch={} cores={cores} host={}\n\
-             lang={} theme={} volume={:.0}% wave={} focus={} loop={}\n\
+             lang={} theme={} volume={:.0}% wave={} focus={} loop={} playing={} audio={audio}\n\
+             timeline={} playhead={} zoom={:.2} compare={cmp} wipe={:.2}\n\
              {}\n---\n",
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -2460,10 +2543,15 @@ impl PlayerApp {
             self.wave_on,
             self.focus,
             self.loop_on,
+            self.playing,
+            self.timeline_len(),
+            self.decoder.as_ref().map(|d| d.current).unwrap_or(0),
+            self.zoom,
+            self.wipe,
             dec.as_deref().unwrap_or("video none"),
         );
         for line in &self.logs {
-            s.push_str(line);
+            s.push_str(&line.text);
             s.push('\n');
         }
         s
@@ -2474,23 +2562,48 @@ impl PlayerApp {
             return;
         }
         let lang = self.lang();
-        let dump = self.log_dump();
         let mut open = true;
+        let dump = self.log_dump();
+        let dark = self.dark;
+        let filter = &mut self.log_filter;
+        let lines: Vec<(LogLevel, String)> = self
+            .logs
+            .iter()
+            .filter(|l| level_visible(l.level, *filter))
+            .map(|l| (l.level, l.text.clone()))
+            .collect();
         egui::Window::new(lang.tr("Günlük", "Log"))
             .open(&mut open)
-            .default_size([540.0, 420.0])
+            .default_size([640.0, 440.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button(lang.tr("Kopyala", "Copy")).clicked() {
                         ui.ctx().copy_text(dump.clone());
                     }
+                    ui.separator();
+                    for (lvl, label) in [
+                        (LogLevel::Info, lang.tr("Hepsi", "All")),
+                        (LogLevel::Warn, lang.tr("Uyarı", "Warn")),
+                        (LogLevel::Error, lang.tr("Hata", "Error")),
+                    ] {
+                        if ui
+                            .selectable_label(*filter == lvl, label)
+                            .clicked()
+                        {
+                            *filter = lvl;
+                        }
+                    }
+                    ui.separator();
+                    ui.weak(format!("{} / {}", lines.len(), self.logs.len()));
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        ui.monospace(&dump);
+                        for (level, text) in &lines {
+                            ui.colored_label(level.color(dark), text);
+                        }
                     });
             });
         if !open {
@@ -2731,7 +2844,7 @@ impl PlayerApp {
         self.ended = false;
         if dest != already {
             if let Some(Err(e)) = self.decoder.as_mut().map(|d| d.seek(dest)) {
-                self.log(format!("seek fail {e}"));
+                self.log_err(format!("seek fail {e}"));
                 self.status = e;
             }
         }
@@ -2775,6 +2888,10 @@ impl PlayerApp {
             }
         }
         self.loop_on = true;
+        self.log(format!(
+            "loop in={frame} span={:?}",
+            self.loop_range()
+        ));
     }
 
     fn set_loop_out(&mut self, frame: u64) {
@@ -2795,6 +2912,10 @@ impl PlayerApp {
             }
         }
         self.loop_on = true;
+        self.log(format!(
+            "loop out={frame} span={:?}",
+            self.loop_range()
+        ));
     }
 
     fn set_loop_span(&mut self, a: u64, b: u64) {
@@ -2802,9 +2923,13 @@ impl PlayerApp {
         self.loop_in = Some(lo);
         self.loop_out = Some(hi);
         self.loop_on = true;
+        self.log(format!("loop span {lo}..{hi}"));
     }
 
     fn clear_loop(&mut self) {
+        if self.loop_in.is_some() || self.loop_out.is_some() {
+            self.log("loop cleared");
+        }
         self.loop_in = None;
         self.loop_out = None;
         self.loop_on = false;
@@ -4063,6 +4188,15 @@ fn save_color_image(ffmpeg: &Path, image: &ColorImage, dest: &Path) -> Result<()
         Ok(())
     } else {
         Err("ffmpeg png".into())
+    }
+}
+
+/// Which severities a filter shows: All → everything, Warn/Error → that level or worse.
+fn level_visible(level: LogLevel, filter: LogLevel) -> bool {
+    match filter {
+        LogLevel::Info => true,
+        LogLevel::Warn => level != LogLevel::Info,
+        LogLevel::Error => level == LogLevel::Error,
     }
 }
 

@@ -2,6 +2,14 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.13
+
+- Log lines carry a level (`INF` / `WRN` / `ERR`), shown in colour, with All / Warn / Error filters
+- Header block now reports playing, audio, timeline, playhead, zoom and compare state
+- Log mirrors to `session.log` next to `lang`, so it survives a close; crash log gains the version and exe
+- More events logged: loop in/out/span/clear, copy and compare saves, URL extraction and download, start pid/exe/data dir
+- Failures now log as `ERR` instead of blending into the rest
+
 ## 0.1.12
 
 - Update check lists every release newer than this build, not just the latest
