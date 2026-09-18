@@ -33,7 +33,7 @@ const ABOUT_URL: &str = "https://github.com/GroophyLifefor";
 const REPO_URL: &str = "https://github.com/GroophyLifefor/vfx-editor";
 const REPO_RELEASES: &str = "https://github.com/GroophyLifefor/vfx-editor/releases/latest";
 const REPO_API: &str =
-    "https://api.github.com/repos/GroophyLifefor/vfx-editor/releases/latest";
+    "https://api.github.com/repos/GroophyLifefor/vfx-editor/releases?per_page=30";
 const EXE_DOWNLOAD: &str =
     "https://github.com/GroophyLifefor/vfx-editor/releases/latest/download/vfx_editor.exe";
 const ABOUT_FEATURES: &[(&str, &str)] = &[
@@ -395,8 +395,10 @@ struct PlayerApp {
     fetch: Option<mpsc::Receiver<FetchEvent>>,
     format_pick: Option<(String, Vec<FormatOpt>)>,
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
-    update_rx: Option<mpsc::Receiver<Option<String>>>,
-    update_url: Option<String>,
+    update_rx: Option<mpsc::Receiver<Option<UpdateInfo>>>,
+    update_info: Option<UpdateInfo>,
+    /// Suppress the auto-opened "what's new" panel after the user dismisses it.
+    update_notes_hidden: bool,
     update_modal: Option<UpdateModal>,
     about_open: bool,
     log_open: bool,
@@ -508,6 +510,60 @@ enum UpdateModal {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum UpdateKind {
+    Patch,
+    Minor,
+    Major,
+}
+
+impl UpdateKind {
+    fn from_tags(from: &str, to: &str) -> Self {
+        let (a, b, c) = parse_ver(from);
+        let (x, y, z) = parse_ver(to);
+        if x != a {
+            Self::Major
+        } else if y != b {
+            Self::Minor
+        } else if z != c {
+            Self::Patch
+        } else if to != from {
+            Self::Patch
+        } else {
+            Self::Minor
+        }
+    }
+
+    fn tr(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Patch => ("Yama", "Patch"),
+            Self::Minor => ("Yeni özellikler", "New features"),
+            Self::Major => ("Büyük sürüm", "Major release"),
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::Patch => Color32::from_rgb(90, 110, 130),
+            Self::Minor => Color32::from_rgb(32, 140, 120),
+            Self::Major => Color32::from_rgb(180, 80, 50),
+        }
+    }
+}
+
+/// A GitHub release: tag plus its notes, ready to render.
+struct UpdateRelease {
+    tag: String,
+    title: String,
+    body: String,
+}
+
+struct UpdateInfo {
+    target: String,
+    kind: UpdateKind,
+    releases: Vec<UpdateRelease>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum RangeDrag {
     Create { origin: u64 },
     In,
@@ -584,7 +640,8 @@ impl PlayerApp {
             format_pick: None,
             export: None,
             update_rx: None,
-            update_url: None,
+            update_info: None,
+            update_notes_hidden: false,
             update_modal: None,
             about_open: false,
             log_open: false,
@@ -2124,18 +2181,18 @@ impl PlayerApp {
     }
 
     fn spawn_update_check(&mut self) {
-        if self.update_rx.is_some() || self.update_url.is_some() {
+        if self.update_rx.is_some() || self.update_info.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(latest_update_url());
+            let _ = tx.send(latest_update_info());
         });
         self.update_rx = Some(rx);
     }
 
     fn begin_update(&mut self) {
-        let Some(tag) = self.update_url.take() else {
+        let Some(info) = self.update_info.take() else {
             return;
         };
         let lang = self.lang();
@@ -2147,10 +2204,10 @@ impl PlayerApp {
                 self.status = lang
                     .tr("Güncelleme indiriliyor…", "Downloading update…")
                     .into();
-                self.update_modal = Some(UpdateModal::Busy(tag));
+                self.update_modal = Some(UpdateModal::Busy(info.target));
             }
             Err(e) => {
-                self.update_url = Some(tag);
+                self.update_info = Some(info);
                 self.status = e.clone();
                 self.update_modal = Some(UpdateModal::Fail(e));
             }
@@ -2171,7 +2228,12 @@ impl PlayerApp {
         let _ = std::fs::remove_file(update_state_path());
         let _ = std::fs::remove_file(just_updated_path());
         let tag = tag.clone();
-        self.update_url = Some(tag);
+        // Restore enough of the info to offer a retry; notes are re-fetched on next check.
+        self.update_info = Some(UpdateInfo {
+            kind: UpdateKind::from_tags(APP_VERSION, &tag),
+            target: tag,
+            releases: Vec::new(),
+        });
         let msg = self
             .lang()
             .tr("İndirme başarısız", "Download failed")
@@ -2185,10 +2247,105 @@ impl PlayerApp {
             return;
         }
         let lang = self.lang();
+        let mut close = false;
+        let mut go = false;
+
+        // What-changed window, shown while the user hasn't dismissed the available update.
+        if self.update_modal.is_none() && !self.update_notes_hidden {
+            if let Some(info) = &self.update_info {
+                let (badge_tr, badge_en) = info.kind.tr();
+                let badge = if lang == Lang::En { badge_en } else { badge_tr };
+                let lead = if lang == Lang::En {
+                    format!("Changes across {} release(s)", info.releases.len())
+                } else {
+                    format!("{} sürümde biriken değişiklikler", info.releases.len())
+                };
+                egui::Window::new(lang.tr("Güncelleme var", "Update available"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_min_width(520.0);
+                        ui.set_max_width(520.0);
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("v{APP_VERSION}"));
+                            ui.weak("→");
+                            ui.strong(&info.target);
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Button::new(badge).fill(info.kind.color()));
+                            ui.weak(lead);
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(340.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for rel in &info.releases {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.strong(if rel.title.is_empty() {
+                                            &rel.tag
+                                        } else {
+                                            &rel.title
+                                        });
+                                        ui.weak(&rel.tag);
+                                    });
+                                    let body = if rel.body.trim().is_empty() {
+                                        lang.tr("(not yok)", "(no notes)").to_string()
+                                    } else {
+                                        rel.body.trim().to_string()
+                                    };
+                                    for line in body.lines() {
+                                        let line = line.trim_start_matches("- ").trim();
+                                        // CI prepends a boilerplate line to every release.
+                                        if line.is_empty() {
+                                            ui.add_space(3.0);
+                                        } else if line.starts_with("Windows x64")
+                                            || line.contains("no installer, FFmpeg")
+                                        {
+                                            continue;
+                                        } else {
+                                            ui.label(format!("• {line}"));
+                                        }
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                }
+                            });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(lang.tr("Güncelle", "Update"))
+                                        .fill(Color32::from_rgb(32, 140, 120)),
+                                )
+                                .clicked()
+                            {
+                                go = true;
+                                close = true;
+                            }
+                            if ui.button(lang.tr("Daha sonra", "Later")).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            }
+            if go {
+                self.begin_update();
+            }
+            if close {
+                self.update_notes_hidden = true;
+                self.update_modal = None;
+            }
+            return;
+        }
+
+        // status window: busy / failed / done
         let Some(kind) = &self.update_modal else {
             return;
         };
-        let mut close = false;
         egui::Window::new(lang.tr("Güncelleme", "Update"))
             .collapsible(false)
             .resizable(false)
@@ -2347,7 +2504,7 @@ impl PlayerApp {
         };
         match rx.try_recv() {
             Ok(url) => {
-                self.update_url = url;
+                self.update_info = url;
                 self.update_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
@@ -2444,11 +2601,18 @@ impl PlayerApp {
                         {
                             open_browser(REPO_RELEASES);
                         }
-                        if self.update_url.is_some() {
+                        let upd = self.update_info.as_ref().map(|i| {
+                            let (tr, en) = i.kind.tr();
+                            (if lang == Lang::En { en } else { tr }, i.kind.color())
+                        });
+                        if let Some((badge, color)) = upd {
                             if ui
                                 .add(
-                                    egui::Button::new(lang.tr("Güncelle", "Update"))
-                                        .fill(Color32::from_rgb(32, 140, 120)),
+                                    egui::Button::new(format!(
+                                        "{} · {badge}",
+                                        lang.tr("Güncelle", "Update")
+                                    ))
+                                    .fill(color),
                                 )
                                 .on_hover_text(lang.tr(
                                     "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
@@ -3136,11 +3300,19 @@ impl eframe::App for PlayerApp {
                     {
                         self.wave_on = !self.wave_on;
                     }
-                    if self.update_url.is_some() {
+                    let upd = self.update_info.as_ref().map(|i| {
+                        let (tr, en) = i.kind.tr();
+                        (if lang == Lang::En { en } else { tr }, i.kind.color())
+                    });
+                    if let Some((badge, color)) = upd {
                         if ui
-                            .add(egui::Button::new(lang.tr("Güncelle", "Update")).fill(
-                                Color32::from_rgb(32, 140, 120),
-                            ))
+                            .add(
+                                egui::Button::new(format!(
+                                    "{} · {badge}",
+                                    lang.tr("Güncelle", "Update")
+                                ))
+                                .fill(color),
+                            )
                             .on_hover_text(lang.tr(
                                 "İndir, bu exe’yi değiştir, aynı argümanlarla aç",
                                 "Download, replace this exe, relaunch with the same args",
@@ -3976,7 +4148,49 @@ fn json_quoted(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].replace("\\/", "/"))
 }
 
-fn latest_update_url() -> Option<String> {
+/// Decode a JSON string body (handles \n, \r, \t, \" and \u escapes) so release notes
+/// keep their line breaks instead of collapsing into one blob.
+fn json_quoted_escaped(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let i = body.find(&pat)?;
+    let mut rest = body[i + pat.len()..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start();
+    rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut it = rest.chars();
+    while let Some(c) = it.next() {
+        if c == '"' {
+            return Some(out);
+        }
+        if c == '\\' {
+            match it.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('u') => {
+                    let hex: String = it.by_ref().take(4).collect();
+                    if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        out.push(ch);
+                    }
+                }
+                Some(other) => out.push(other),
+                None => {}
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// Fetch every release newer than the running build, newest first, with their notes.
+/// `per_page=30` on the API keeps this a single request while covering many versions.
+fn latest_update_info() -> Option<UpdateInfo> {
     let out = Command::new("curl")
         .args([
             "-fsSL",
@@ -3995,11 +4209,33 @@ fn latest_update_url() -> Option<String> {
         return None;
     }
     let body = String::from_utf8_lossy(&out.stdout);
-    let tag = json_quoted(&body, "tag_name")?;
-    if parse_ver(&tag) <= parse_ver(APP_VERSION) {
+    let current = parse_ver(APP_VERSION);
+    let mut releases: Vec<(String, String, String)> = Vec::new();
+    for obj in json_top_objects(&body) {
+        let Some(tag) = json_quoted(obj, "tag_name") else {
+            continue;
+        };
+        if parse_ver(&tag) <= current {
+            continue;
+        }
+        let title = json_quoted_escaped(obj, "name").unwrap_or_default();
+        let notes = json_quoted_escaped(obj, "body").unwrap_or_default();
+        releases.push((tag, title, notes));
+    }
+    if releases.is_empty() {
         return None;
     }
-    Some(tag)
+    releases.sort_by_key(|(tag, _, _)| std::cmp::Reverse(parse_ver(tag)));
+    let target = releases[0].0.clone();
+    let kind = UpdateKind::from_tags(APP_VERSION, &target);
+    Some(UpdateInfo {
+        target,
+        kind,
+        releases: releases
+            .into_iter()
+            .map(|(tag, title, body)| UpdateRelease { tag, title, body })
+            .collect(),
+    })
 }
 
 fn open_browser(url: &str) {

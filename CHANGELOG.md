@@ -2,6 +2,12 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.12
+
+- Update check lists every release newer than this build, not just the latest
+- Update dialog shows the release notes for each of those versions
+- Badge marks the jump as Patch, New features, or Major release
+
 ## 0.1.11
 
 - `Ctrl+S` saves the open video as-is (no trimming); with a loop active it trims and saves instead
