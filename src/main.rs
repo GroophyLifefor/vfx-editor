@@ -1250,6 +1250,52 @@ impl PlayerApp {
         }
     }
 
+    /// Ctrl+S: save the A video as-is (no trimming).
+    /// If a loop is active, fall back to "Trim and Save As" instead.
+    fn quick_save(&mut self) {
+        if self.decoder.is_none() || self.export.is_some() {
+            return;
+        }
+        if self.loop_on {
+            self.export_loop();
+            return;
+        }
+        let Some(dec) = &self.decoder else {
+            return;
+        };
+        let src = dec.path().to_path_buf();
+        let ext = src
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mp4");
+        let stem = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip");
+        let suggested = format!("{stem}_copy.{ext}");
+        let Some(dest) = rfd::FileDialog::new()
+            .add_filter(ext, &[ext])
+            .set_file_name(&suggested)
+            .save_file()
+        else {
+            return;
+        };
+        if src.canonicalize().ok() == dest.canonicalize().ok() {
+            self.status = self
+                .lang()
+                .tr("Kaynak dosyanın üzerine yazma", "Don't overwrite the source")
+                .into();
+            return;
+        }
+        match std::fs::copy(&src, &dest) {
+            Ok(_) => {
+                self.status = dest.display().to_string();
+                self.log(format!("saved {}", dest.display()));
+            }
+            Err(e) => self.status = format!("save: {e}"),
+        }
+    }
+
     fn save_compare(&mut self) {
         let Some(c) = &self.compare else {
             return;
@@ -2747,6 +2793,7 @@ impl PlayerApp {
         let mut step = 0i64;
         let mut mark_in = false;
         let mut mark_out = false;
+        let mut save = false;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::CTRL, Key::ArrowLeft) {
                 step = -10;
@@ -2766,7 +2813,13 @@ impl PlayerApp {
             if i.consume_key(Modifiers::NONE, Key::O) {
                 mark_out = true;
             }
+            if i.consume_key(Modifiers::CTRL, Key::S) {
+                save = true;
+            }
         });
+        if save {
+            self.quick_save();
+        }
         if play {
             self.toggle_play(ctx);
         }

@@ -2,6 +2,10 @@
 
 CI takes the `##` section that matches `Cargo.toml`.
 
+## 0.1.11
+
+- `Ctrl+S` saves the open video as-is (no trimming); with a loop active it trims and saves instead
+
 ## 0.1.10
 
 - Start playback when launched by dropping a video on the exe
